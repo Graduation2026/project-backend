@@ -1,0 +1,36 @@
+services:
+  # The Brain: FastAPI Backend + Ghidra Engine
+  sentinel-backend:
+    build: .
+    container_name: sentinel-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - sentinel-temp:/app/temp
+    environment:
+      - GHIDRA_INSTALL_DIR=/opt/ghidra
+      - FEATURES_DIR=/app/temp/features
+      - PYTHONUNBUFFERED=1
+      - _JAVA_OPTIONS="-Xmx2G"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+
+  # The Face: Nginx Web Server for the Dashboard
+  sentinel-frontend:
+    build: ../project-frontend
+    container_name: sentinel-frontend
+    ports:
+      - "9090:80"
+    depends_on:
+      - sentinel-backend
+    restart: unless-stopped
+
+volumes:
+  sentinel-temp:
+
+networks:
+  default:
+    name: sentinel-network

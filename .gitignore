@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+temp/
+ghidra_projects/
+ghidra_output/
+*.log
+.DS_Store
+.vscode/
+.idea/
