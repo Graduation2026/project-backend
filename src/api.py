@@ -23,8 +23,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from .config import (
     ALLOWED_EXTENSIONS,
@@ -83,17 +82,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Mount static files
-app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "static")), name="static")
-
-
-# --- GET / (Web Dashboard) ---
-@app.get("/", tags=["Dashboard"], include_in_schema=False)
-async def dashboard():
-    """Serve the main web dashboard."""
-    return FileResponse(str(PROJECT_ROOT / "templates" / "index.html"))
-
 
 # --- GET /health ---
 @app.get("/health", tags=["General"])

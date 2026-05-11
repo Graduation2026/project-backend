@@ -11,9 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent  # project-ml/
 
 # ─── GHIDRA CONFIGURATION ───────────────────────────────────────────────────
 GHIDRA_INSTALL_DIR = Path(
-    r"D:\Grad Project\Ghidra\ghidra_12.0.3_PUBLIC_20260210\ghidra_12.0.3_PUBLIC"
+    os.getenv("GHIDRA_INSTALL_DIR", "/opt/ghidra")
 )
-GHIDRA_HEADLESS = GHIDRA_INSTALL_DIR / "support" / "analyzeHeadless.bat"
+_ghidra_executable = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
+GHIDRA_HEADLESS = GHIDRA_INSTALL_DIR / "support" / _ghidra_executable
 GHIDRA_SCRIPT_DIR = PROJECT_ROOT / "ghidra_scripts"
 GHIDRA_SCRIPT_NAME = "InferenceScanner.java"
 
@@ -22,8 +23,8 @@ GHIDRA_TIMEOUT_SECONDS = 900  # 15 minutes
 
 # ─── ML MODEL CONFIGURATION ─────────────────────────────────────────────────
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-MODEL_PATH = PROJECT_ROOT / "notebooks" / "vulnerability_detector_rf.pkl"
-VECTORIZER_PATH = PROJECT_ROOT / "notebooks" / "tfidf_vectorizer.pkl"
+MODEL_PATH = ARTIFACTS_DIR / "vulnerability_detector_rf.pkl"
+VECTORIZER_PATH = ARTIFACTS_DIR / "tfidf_vectorizer.pkl"
 
 # TF-IDF parameters (must match training)
 TFIDF_MAX_FEATURES = 3000
@@ -37,7 +38,7 @@ RF_N_JOBS = -1  # Use all CPU cores
 # ─── TRAINING DATA ──────────────────────────────────────────────────────────
 LABELS_CSV = PROJECT_ROOT / "labels_mapping.csv"
 FEATURES_DIR = Path(
-    r"C:\Users\ASUS\Desktop\Project_Work\Grad Updates April\GhidraExtraction\DiverseVul_Features"
+    os.getenv("FEATURES_DIR", str(PROJECT_ROOT / "temp" / "features"))
 )
 
 # ─── TEMP DIRECTORIES ───────────────────────────────────────────────────────
