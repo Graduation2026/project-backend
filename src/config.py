@@ -5,18 +5,22 @@ All paths, model parameters, and constants live here.
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 # ─── PROJECT ROOT ────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent.parent  # project-ml/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # project-backend/
+
+# Load environment variables
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ─── GHIDRA CONFIGURATION ───────────────────────────────────────────────────
 GHIDRA_INSTALL_DIR = Path(
-    os.getenv("GHIDRA_INSTALL_DIR", "/opt/ghidra")
+    os.getenv("GHIDRA_INSTALL_DIR", "d:/ml_binpool_attempt/ghidra_12.0.3_PUBLIC")
 )
 _ghidra_executable = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
 GHIDRA_HEADLESS = GHIDRA_INSTALL_DIR / "support" / _ghidra_executable
 GHIDRA_SCRIPT_DIR = PROJECT_ROOT / "ghidra_scripts"
-GHIDRA_SCRIPT_NAME = "InferenceScanner.java"
+GHIDRA_SCRIPT_NAME = "ExtractAllCFGs.java"
 
 # Timeout for Ghidra analysis (seconds) — some binaries can be large
 GHIDRA_TIMEOUT_SECONDS = 900  # 15 minutes
@@ -47,8 +51,12 @@ GHIDRA_OUTPUT_DIR = PROJECT_ROOT / "temp" / "ghidra_output"
 GHIDRA_PROJECT_DIR = PROJECT_ROOT / "temp" / "ghidra_projects"
 
 # ─── FILE VALIDATION ────────────────────────────────────────────────────────
-ALLOWED_EXTENSIONS = {".exe", ".o", ".elf", ".dll", ".so", ".bin"}
+ALLOWED_EXTENSIONS = {
+    ".exe", ".o", ".elf", ".dll", ".so", ".bin",
+    ".c", ".cpp", ".cc", ".h", ".hpp", ".cxx"
+}
 MAX_FILE_SIZE_MB = 50
+
 
 # ─── LABEL MAPPING ──────────────────────────────────────────────────────────
 LABEL_MAP = {0: "Safe", 1: "Vulnerable"}

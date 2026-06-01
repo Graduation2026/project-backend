@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import shutil
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -23,7 +24,9 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from .config import (
     ALLOWED_EXTENSIONS,
@@ -37,6 +40,8 @@ from .config import (
 )
 from .ghidra_runner import GhidraError, run_ghidra_analysis
 from .predictor import predictor
+from .rag_service import rag_service
+from .utils.pdf_generator import convert_markdown_to_pdf
 
 # --- Logging ---
 logging.basicConfig(
@@ -45,6 +50,24 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("api")
+
+
+def compile_source(source_path: Path, output_o_path: Path) -> Path:
+    """
+    Compiles a C/C++ source file into a relocatable object file (.o)
+    using MinGW GCC/G++, supporting standalone functions without main().
+    """
+    file_ext = source_path.suffix.lower()
+    compiler = "g++" if file_ext in [".cpp", ".cc", ".cxx", ".hpp"] else "gcc"
+    
+    # Run compiler: gcc -O0 -g -c -o output_o_path source_path
+    command = [compiler, "-O0", "-g", "-c", "-o", str(output_o_path), str(source_path)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise Exception(f"MinGW compilation failed:\n{result.stderr}")
+        
+    return output_o_path
 
 
 # --- Lifespan: load models on startup ---
@@ -66,9 +89,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Sentinel AI - Vulnerability Detection API",
     description=(
-        "Upload a compiled binary (.exe, .o, .elf) and get an AI-powered "
+        "Upload a compiled binary (.exe, .o, .elf) or C/C++ source file and get an AI-powered "
         "vulnerability assessment using Ghidra reverse engineering + "
-        "Random Forest machine learning."
+        "GATv2 Graph Attention Network (GNN) machine learning."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -82,6 +105,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static reports folder configuration
+reports_static_dir = PROJECT_ROOT / "src" / "static" / "reports"
+reports_static_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/reports", StaticFiles(directory=str(reports_static_dir)), name="reports")
+
+# --- Serve Frontend Locally ---
+@app.get("/", tags=["Frontend"])
+async def serve_dashboard():
+    """Serves the main dashboard user interface."""
+    frontend_index = PROJECT_ROOT.parent / "project-frontend" / "templates" / "index.html"
+    if frontend_index.exists():
+        return FileResponse(str(frontend_index))
+    raise HTTPException(status_code=404, detail=f"Frontend index.html not found at: {frontend_index}")
+
+# Mount frontend static folder
+frontend_static = PROJECT_ROOT.parent / "project-frontend" / "static"
+if frontend_static.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_static)), name="static")
 
 # --- GET /health ---
 @app.get("/health", tags=["General"])
@@ -116,16 +158,16 @@ async def model_info():
 @app.post("/analyze", tags=["Analysis"])
 async def analyze_binary(file: UploadFile = File(...)):
     """
-    Upload a binary file for vulnerability analysis.
+    Upload a binary file or C/C++ source code for vulnerability analysis.
 
     The system will:
-    1. Validate the file type
+    1. Validate the file type (.c and .cpp files are auto-compiled on the fly)
     2. Run Ghidra headless reverse engineering
     3. Extract assembly features (opcodes)
     4. Run the trained Random Forest model
     5. Return a prediction with confidence score
 
-    **Accepted formats:** .exe, .o, .elf, .dll, .so, .bin
+    **Accepted formats:** .exe, .o, .elf, .dll, .so, .bin, .c, .cpp, .cc, .h, .hpp
     """
     total_start = time.time()
 
@@ -141,7 +183,7 @@ async def analyze_binary(file: UploadFile = File(...)):
                 "error": "Invalid file type",
                 "received": file_ext,
                 "allowed": sorted(ALLOWED_EXTENSIONS),
-                "message": f"Only binary executables are accepted: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+                "message": f"Only binaries and source code files are accepted: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
             },
         )
 
@@ -156,8 +198,10 @@ async def analyze_binary(file: UploadFile = File(...)):
         )
 
     # Save uploaded file
+    import re
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_filename = f"{timestamp}_{file.filename}"
+    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
+    safe_filename = f"{timestamp}_{safe_name}"
     upload_path = UPLOAD_DIR / safe_filename
     upload_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -188,13 +232,39 @@ async def analyze_binary(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
 
+    # Route and compile C/C++ source code if uploaded
+    is_source_code = file_ext in {".c", ".cpp", ".cc", ".h", ".hpp", ".cxx"}
+    binary_path = upload_path
+    compiled_path = None
+
+    if is_source_code:
+        logger.info(f"Source code detected. Compiling {file.filename} to object file...")
+        compiled_filename = f"{timestamp}_{Path(file.filename).stem}.o"
+        compiled_path = UPLOAD_DIR / compiled_filename
+        try:
+            compile_source(upload_path, compiled_path)
+            binary_path = compiled_path
+            logger.info(f"Compilation success! Object file generated: {compiled_filename}")
+        except Exception as e:
+            if upload_path.exists():
+                upload_path.unlink()
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "MinGW compilation failed",
+                    "message": "Your uploaded C/C++ code has syntax errors or compiler incompatibilities.",
+                    "details": str(e)
+                },
+            )
+
     # Run Ghidra Analysis
     ghidra_start = time.time()
     try:
         logger.info("Starting Ghidra analysis...")
-        features_file = run_ghidra_analysis(upload_path)
+        features_file = run_ghidra_analysis(binary_path)
         ghidra_time = time.time() - ghidra_start
         logger.info(f"Ghidra completed in {ghidra_time:.1f}s")
+
     except GhidraError as e:
         raise HTTPException(
             status_code=500,
@@ -206,49 +276,54 @@ async def analyze_binary(file: UploadFile = File(...)):
             detail={"error": "Ghidra not found", "message": str(e)},
         )
 
-    # Read extracted features
-    try:
-        with open(features_file, "r", encoding="utf-8", errors="ignore") as f:
-            features_text = f.read().strip()
-
-        if not features_text:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "Empty features",
-                    "message": "Ghidra extracted no features from this binary. It may be corrupted or packed.",
-                },
-            )
-
-        logger.info(f"Features loaded: {len(features_text)} characters")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read features file: {str(e)}")
-
-    # Run ML Prediction
+    # Run ML Prediction using GNN
     ml_start = time.time()
     try:
-        result = predictor.predict(features_text)
+        logger.info("Running GNN prediction on CFGs...")
+        result = predictor.predict(features_file)
         ml_time = time.time() - ml_start
         logger.info(
-            f"Prediction: {result['prediction']} "
-            f"(confidence: {result['confidence']:.2%}, {ml_time:.3f}s)"
+            f"GNN Prediction completed in {ml_time:.3f}s | Result: {result['prediction']} "
+            f"(confidence: {result['confidence']:.2%})"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ML prediction failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"GNN prediction failed: {str(e)}")
 
-    # Build response
+    # Generate RAG Vulnerability Report and Render PDF
+    try:
+        logger.info("Generating RAG security report...")
+        report_markdown = rag_service.generate_vulnerability_report(result["flagged_functions"])
+        
+        pdf_filename = f"report_{sha256_hash}.pdf"
+        pdf_path = reports_static_dir / pdf_filename
+        
+        logger.info(f"Rendering report PDF to {pdf_path}...")
+        convert_markdown_to_pdf(report_markdown, pdf_path)
+        pdf_url = f"/reports/{pdf_filename}"
+    except Exception as e:
+        logger.error(f"RAG or PDF generation failed: {str(e)}")
+        report_markdown = f"# Analysis Completed\n\nFailed to generate interactive RAG report: {str(e)}"
+        pdf_url = ""
+
+    # Build response payload combining Sentinel dashboard compatibility + Ultimate RAG blueprint
     total_time = time.time() - total_start
+    verdict = "SAFE" if result["label"] == 0 else "VULNERABLE"
+    risk_score = float(result["confidence"] * 100 if verdict == "VULNERABLE" else (1 - result["confidence"]) * 100)
 
     response = {
+        "status": "success",
         "filename": file.filename,
         "sha256": sha256_hash,
         "prediction": result["prediction"],
         "label": result["label"],
         "confidence": result["confidence"],
         "top_features": result["top_features"],
+        "verdict": verdict,
+        "risk_score": round(risk_score, 1),
+        "flagged_functions_count": len(result["flagged_functions"]),
+        "flagged_functions": result["flagged_functions"],
+        "report_markdown": report_markdown,
+        "pdf_url": pdf_url,
         "timing": {
             "ghidra_seconds": round(ghidra_time, 2),
             "ml_seconds": round(ml_time, 4),
@@ -257,7 +332,6 @@ async def analyze_binary(file: UploadFile = File(...)):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    verdict = "SAFE" if result["label"] == 0 else "VULNERABLE"
     logger.info(
         f"RESULT: {file.filename} -> {verdict} "
         f"({result['confidence']:.2%}) in {total_time:.1f}s"
@@ -267,13 +341,50 @@ async def analyze_binary(file: UploadFile = File(...)):
     try:
         if upload_path.exists():
             upload_path.unlink()
+        if compiled_path and compiled_path.exists():
+            compiled_path.unlink()
+        if features_file.exists():
+            features_file.unlink()
         if features_file.parent.exists() and features_file.parent != UPLOAD_DIR:
             shutil.rmtree(features_file.parent, ignore_errors=True)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Error during temp file cleanup: {e}")
 
     return JSONResponse(content=response)
 
-# Trigger server reload to load new models
 
-# Trigger reload for ensemble model
+# --- Chatbot API Models & Endpoint ---
+
+class ChatRequest(BaseModel):
+    session_id: str
+    query: str
+    decompiled_code: str = ""
+    chat_history: list[dict] = []
+
+
+@app.post("/chat", tags=["Chatbot"])
+async def chat_with_assistant(request: ChatRequest):
+    """
+    Interactive real-time chat with the pre-loaded SEI CERT C reference guides and uploaded function code.
+    Allows developers to ask clarifying questions or get detailed secure remediation code rewrites.
+    """
+    try:
+        response_text = rag_service.get_chat_response(
+            query=request.query,
+            decompiled_code=request.decompiled_code,
+            chat_history=request.chat_history
+        )
+        return {
+            "status": "success",
+            "response": response_text
+        }
+    except Exception as e:
+        logger.error(f"Chat failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Chatbot failed",
+                "message": str(e)
+            }
+        )
+
