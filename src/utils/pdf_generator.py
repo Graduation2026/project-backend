@@ -9,7 +9,7 @@ class SecurityReportPDF(FPDF):
         self.rect(0, 0, 210, 20, "F")
         self.set_text_color(255, 255, 255)
         self.set_font("Helvetica", "B", 12)
-        self.cell(0, 10, "SENTINEL AI — BINARY SECURITY AUDIT REPORT", ln=True, align="C")
+        self.cell(0, 10, "SENTINEL AI - BINARY SECURITY AUDIT REPORT", ln=True, align="C")
         self.ln(10)
 
     def footer(self):
@@ -19,11 +19,38 @@ class SecurityReportPDF(FPDF):
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
 
+def sanitize_unicode(text: str) -> str:
+    """
+    Sanitizes standard Markdown text to replace unsupported Unicode characters
+    with standard Latin-1/ASCII equivalents to prevent FPDF font failures.
+    """
+    replacements = {
+        "\u2014": " - ",  # Em-dash
+        "\u2013": "-",    # En-dash
+        "\u201c": '"',    # Left curly double quote
+        "\u201d": '"',    # Right curly double quote
+        "\u2018": "'",    # Left curly single quote
+        "\u2019": "'",    # Right curly single quote
+        "\u2022": "*",    # Bullet point
+        "\u2010": "-",    # Hyphen
+        "\u2011": "-",    # Non-breaking hyphen
+        "\u00a0": " ",    # Non-breaking space
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    
+    # Fallback to ignore any remaining non-latin1 characters
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
 def convert_markdown_to_pdf(markdown_text: str, pdf_path: str | Path):
     """
     Converts a Markdown-formatted vulnerability report into a beautifully styled PDF.
     Parses basic Markdown elements like Headers, Bold text, Bullet lists, and Code Blocks.
     """
+    # Sanitize incoming markdown to remove unsafe unicode symbols
+    markdown_text = sanitize_unicode(markdown_text)
+
     pdf = SecurityReportPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
