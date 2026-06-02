@@ -1,62 +1,81 @@
-# Sentinel AI - Binary Vulnerability Detection System
+# Sentinel AI — Backend Audit Server & RAG Engine
 
-Sentinel AI is a professional, containerized microservice system that uses **Ghidra Reverse Engineering** and **Random Forest Machine Learning** to detect vulnerabilities in compiled binary files (.exe, .o, .elf, etc.).
+This is the central orchestration server for the **Sentinel AI Ecosystem**. It handles dynamic C/C++ source compilation, disassembles binaries via headless Ghidra, runs GNN (GATv2) vulnerability prediction, generates LangChain Retrieval-Augmented Generation (RAG) remediations, compiles PDFs, and hosts the real-time interactive chatbot.
 
-This project is modularized into separate services, orchestrated with Docker for 100% portability.
+---
 
-## 🚀 Quick Start (Running the Project)
+## ─── KEY INTEGRATED FEATURES ──────────────────────────────────────────────────
 
-You only need **Docker Desktop** installed. 
+1.  **Dynamic Source Compiler:** On-the-fly MinGW wrapper that compiles raw `.c`/`.cpp` files into relocatable object code `.o` for instant analysis.
+2.  **GNN Vulnerability Predictor:** Uses a Graph Attention Network (GATv2Conv + Global Readout) loaded with our optimal **Fold 4 (`best_fold4.pt`)** pre-trained weights to analyze basic-block control flow graph (CFG) structures in ~1.8 seconds.
+3.  **LangChain RAG Security Auditor:** Queries a vectorized Chroma DB (memorized with memory safety guidelines, CWE-119, CWE-120, CWE-787, SEI CERT C) using `models/gemini-embedding-2` and `models/gemini-3-flash-preview` to write deep vulnerability compliance audits.
+4.  **PDF Report Compiler:** Converts RAG markdown logs into downloadable, high-fidelity security audit PDFs.
+5.  **Interactive Chatbot Sidebar:** Real-time conversational context loop via `POST /chat` linked directly to your RAG audit history.
 
-### Step 1: Clone the Ecosystem
-Because this is a microservice architecture, you must clone all 4 repositories into the same parent folder on your computer:
-*   `project-backend`
-*   `project-frontend`
-*   `project-ml`
-*   `project-reverse-engineering`
+---
 
-### Step 2: Launch the System
-Navigate into the **`project-backend`** folder and run:
+## ─── DEVELOPER PREREQUISITES ────────────────────────────────────────────────
+
+Your local machine needs the following environment setups to run the live disassembling and API server:
+
+### 1. Java 17+ (Required by Ghidra)
+Ghidra's headless analyzer is built on Java. Ensure you have Java 17 or higher in your environment path:
 ```bash
-docker compose up --build -d
+java -version
 ```
-3.  **Access the Dashboard:** Open your browser and go to:
-    [http://localhost:9090](http://localhost:9090)
+
+### 2. Ghidra Desktop Installation
+1.  Download **Ghidra 12.0.3_PUBLIC** (or your preferred release) from the official [Ghidra Releases Page](https://github.com/NationalSecurityAgency/ghidra/releases).
+2.  Extract the zip folder anywhere on your local computer (e.g., `C:\ghidra_12.0.3_PUBLIC` or `D:\ghidra_12.0.3_PUBLIC`).
 
 ---
 
-## 🏗️ System Architecture
+## ─── QUICK SETUP & RUNNING ──────────────────────────────────────────────────
 
-The system is built using a modern **Microservice Architecture**:
+### Step 1: Create a local Virtual Environment & Install Libraries
+Navigate into the `project-backend` folder:
 
-*   **Frontend (Port 9090):** An Nginx-powered web dashboard that handles file uploads and displays visual analysis results.
-*   **Backend (Port 8000):** A FastAPI server that orchestrates the heavy lifting:
-    *   **Reverse Engineering:** Uses an internal "Headless" Ghidra engine to disassemble binaries.
-    *   **Machine Learning:** Uses a pre-trained Random Forest model (83% accuracy) to predict if the extracted opcodes represent a vulnerability.
-    *   **API Docs:** Interactive documentation available at [http://localhost:8000/docs](http://localhost:8000/docs).
-
----
-
-## 📁 Repository Structure
-
-*   `project-frontend/`: The UI code, styles, and Nginx configuration.
-*   `project-backend/`: The API logic, Ghidra runner, and AI model logic.
-*   `artifacts/`: Contains the pre-trained ML models (`.pkl`) and model metadata.
-*   `ghidra_scripts/`: The Java scripts used by Ghidra to extract features.
-
----
-
-## 🛠️ For Developers
-
-### Retraining the Model
-If you wish to retrain the AI with new data, navigate to the `project-backend` folder and run the training script:
 ```bash
-python scripts/train_model.py
+# Windows
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+
+# Linux/macOS
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
-*Note: This will automatically update `model_metadata.json` with new accuracy metrics.*
+
+### Step 2: Configure Environment Secrets (`.env`)
+Create a file named `.env` in the root of `project-backend/` (this file is Git-ignored for privacy):
+
+```env
+# Google Gemini API Access
+GOOGLE_API_KEY="AIzaSy..."
+GEMINI_API_KEY="AIzaSy..."
+
+# Path to your local Ghidra installation folder
+GHIDRA_INSTALL_DIR="C:\ghidra_12.0.3_PUBLIC"
+```
+
+### Step 3: Run the FastAPI Application Server
+Start the server using Uvicorn:
+
+```bash
+python -m uvicorn src.api:app --reload --host 127.0.0.1 --port 8000
+```
+*   The API endpoints will be active at `http://127.0.0.1:8000`.
+*   Interactive documentation is available at `http://127.0.0.1:8000/docs`.
 
 ---
 
-## 🎓 Graduation Project Details
-- **Core Technologies:** Python, FastAPI, Docker, Ghidra, Scikit-learn, Nginx.
-- **Vulnerability Logic:** Based on assembly opcode frequency analysis and threat-level lookup tables for critical mitigations.
+## ─── PROJECT ARCHITECTURE ────────────────────────────────────────────────────
+
+*   `src/api.py`: FastAPI server routes, cors, upload handlers, compiler wrappers, and `/chat` endpoint.
+*   `src/ghidra_runner.py`: Triggers headless Ghidra inside a subprocess to run `ExtractAllCFGs.java`.
+*   `src/predictor.py`: Standardizes instructions, queries Word2Vec embeddings, and runs GNN PyTorch inference.
+*   `src/rag_service.py`: Retrieval QA chain seeding, Chroma vector search, and Markdown generation.
+*   `src/utils/pdf_generator.py`: Generates downloadable visual PDFs.
+*   `artifacts/`: Contains our pre-trained model weights (`best_fold4.pt`, `asm2vec.model`).
+*   `ghidra_scripts/ExtractAllCFGs.java`: Flat Java script executed headlessly by Ghidra to trace block instructions and connections.
