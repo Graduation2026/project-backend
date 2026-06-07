@@ -113,12 +113,36 @@ app.mount("/reports", StaticFiles(directory=str(reports_static_dir)), name="repo
 
 # --- Serve Frontend Locally ---
 @app.get("/", tags=["Frontend"])
+async def serve_welcome():
+    """Serves the onboarding welcome landing page."""
+    welcome_html = PROJECT_ROOT.parent / "project-frontend" / "templates" / "welcome.html"
+    if welcome_html.exists():
+        return FileResponse(str(welcome_html))
+    raise HTTPException(status_code=404, detail=f"welcome.html not found at: {welcome_html}")
+
+@app.get("/dashboard", tags=["Frontend"])
 async def serve_dashboard():
     """Serves the main dashboard user interface."""
     frontend_index = PROJECT_ROOT.parent / "project-frontend" / "templates" / "index.html"
     if frontend_index.exists():
         return FileResponse(str(frontend_index))
     raise HTTPException(status_code=404, detail=f"Frontend index.html not found at: {frontend_index}")
+
+@app.get("/guide", tags=["Frontend"])
+async def serve_guide():
+    """Serves the interactive user guide page."""
+    guide_html = PROJECT_ROOT.parent / "project-frontend" / "templates" / "guide.html"
+    if guide_html.exists():
+        return FileResponse(str(guide_html))
+    raise HTTPException(status_code=404, detail=f"guide.html not found at: {guide_html}")
+
+@app.get("/library", tags=["Frontend"])
+async def serve_library():
+    """Serves the interactive threat intelligence reference library."""
+    library_html = PROJECT_ROOT.parent / "project-frontend" / "templates" / "library.html"
+    if library_html.exists():
+        return FileResponse(str(library_html))
+    raise HTTPException(status_code=404, detail=f"library.html not found at: {library_html}")
 
 # Mount frontend static folder
 frontend_static = PROJECT_ROOT.parent / "project-frontend" / "static"
@@ -292,7 +316,12 @@ async def analyze_binary(file: UploadFile = File(...)):
     # Generate RAG Vulnerability Report and Render PDF
     try:
         logger.info("Generating RAG security report...")
-        report_markdown = rag_service.generate_vulnerability_report(result["flagged_functions"])
+        report_markdown = rag_service.generate_vulnerability_report(
+            flagged_functions=result["flagged_functions"],
+            filename=file.filename,
+            sha256_hash=sha256_hash,
+            total_functions=len(result["top_features"])
+        )
         
         pdf_filename = f"report_{sha256_hash}.pdf"
         pdf_path = reports_static_dir / pdf_filename

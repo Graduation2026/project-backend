@@ -63,9 +63,17 @@ class RAGService:
         except Exception:
             count = 0
 
+        # We have 12 documents now (5 original + 4 new CWEs + 3 non-CWE helper guides)
         if count > 0:
-            logger.info(f"Reference database already seeded with {count} documents.")
-            return
+            if count >= 12:
+                logger.info(f"Reference database already seeded with {count} documents.")
+                return
+            else:
+                logger.info(f"Reference database has partial seed ({count} docs). Clearing collection to re-seed...")
+                try:
+                    self.vector_store.delete(ids=self.vector_store.get()["ids"])
+                except Exception as e:
+                    logger.warning(f"Failed to clear collection: {e}")
 
         logger.info("Seeding Reference database with security guidelines...")
         reference_data = [
@@ -127,6 +135,76 @@ class RAGService:
                     "fails immediately with a null pointer dereference rather than silently corrupting memory or enabling exploits."
                 ),
                 "metadata": {"cwe": "CWE-416", "type": "Use After Free", "standard": "CERT C MEM30-C"}
+            },
+            {
+                "content": (
+                    "CWE-190: Integer Overflow or Wraparound. Occurs when a math operation produces a value outside the range "
+                    "that can be stored in the integer type. In C, if an integer overflow occurs during memory allocation "
+                    "calculations (like malloc(size * count)), it can wrap around to a very small number, causing malloc to "
+                    "allocate a tiny buffer while the program still writes the full amount of data, leading to a heap-based buffer overflow. "
+                    "CERT C Rule INT30-C: Ensure that operations on unsigned integers do not wrap. "
+                    "Mitigation: Check for overflow conditions before multiplication or addition, or use secure library safe math modules."
+                ),
+                "metadata": {"cwe": "CWE-190", "type": "Integer Overflow", "standard": "CERT C INT30-C"}
+            },
+            {
+                "content": (
+                    "CWE-476: NULL Pointer Dereference. Occurs when a program dereferences a pointer that is expected to be valid "
+                    "but resolves to NULL. This causes immediate program crash or denial of service, and in some situations "
+                    "(such as kernel context or specific runtime environments), it can lead to arbitrary code execution. "
+                    "CERT C Rule EXP34-C: Do not dereference null pointers. "
+                    "Mitigation: Always check pointers for NULL before dereferencing, especially after memory allocations (malloc/calloc) "
+                    "and API library returns."
+                ),
+                "metadata": {"cwe": "CWE-476", "type": "NULL Pointer Dereference", "standard": "CERT C EXP34-C"}
+            },
+            {
+                "content": (
+                    "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection'). "
+                    "Occurs when an application passes unvalidated user inputs directly to command line executors like system() or popen(). "
+                    "Attackers can insert shell delimiters (like semicolon, ampersand, pipe) to execute arbitrary commands with the privileges of the binary. "
+                    "CERT C Rule ENV33-C: Do not call system(). "
+                    "Mitigation: Avoid system() entirely. Use safe APIs like execve() or createProcess() which pass parameters "
+                    "as discrete arrays rather than raw shell execution strings."
+                ),
+                "metadata": {"cwe": "CWE-78", "type": "OS Command Injection", "standard": "CERT C ENV33-C"}
+            },
+            {
+                "content": (
+                    "CWE-242: Use of Inherently Dangerous Function. Certain legacy standard library functions like gets() cannot be "
+                    "used safely because they do not accept a maximum buffer size. They will copy input characters until a newline "
+                    "is found, making stack-based buffer overflows inevitable if user input exceeds the target array bounds. "
+                    "CERT C Rule MSC24-C: Do not use gets(). "
+                    "Mitigation: Ban gets() completely. Replace with fgets() or secure C11 alternatives like gets_s()."
+                ),
+                "metadata": {"cwe": "CWE-242", "type": "Dangerous Function", "standard": "CERT C MSC24-C"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening Defenses & Binary Protections. Mitigating exploitation in compiled binaries requires "
+                    "compiler-enforced flags: Stack Canaries (-fstack-protector-strong) place guard values on the stack to detect overflows "
+                    "before returning. DEP/NX (Data Execution Prevention / No-Execute) marks data segments as non-executable to prevent shellcode injection. "
+                    "ASLR (Address Space Layout Randomization) compiled with -fPIE -pie randomizes address layouts. Full RELRO (-Wl,-z,relro,-z,now) "
+                    "makes global offset tables read-only to prevent redirection hooks."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "Binary Hardening"}
+            },
+            {
+                "content": (
+                    "Exploitation Mechanics and Code Vulnerability Consequences. Memory safety bugs lead to exploit vectors: Stack Smashing "
+                    "overwrites the saved instruction pointer (EIP/RIP) to redirect control. Return-Oriented Programming (ROP) chains execute "
+                    "snippets of code (gadgets) already in memory to bypass DEP. Heap sprays flood memory to guide execution flow. "
+                    "Understanding these consequences helps engineers prioritize remediation of buffer copies and out-of-bounds writes."
+                ),
+                "metadata": {"cwe": "General", "type": "Exploitation Mechanics", "standard": "Exploit Context"}
+            },
+            {
+                "content": (
+                    "Secure Library Alternatives & API replacements. Legacy C functions (strcpy, strcat, sprintf, gets) should be replaced "
+                    "with safe, bounded variants. Use strncpy or strlcpy for copying, strncat for concatenation, snprintf for formatted printing, "
+                    "and fgets for line input. Always verify that strings are null-terminated and explicitly validate sizes against destination bounds."
+                ),
+                "metadata": {"cwe": "General", "type": "API Alternatives", "standard": "Secure APIs"}
             }
         ]
 
@@ -135,82 +213,109 @@ class RAGService:
             for item in reference_data
         ]
         self.vector_store.add_documents(documents)
-        logger.info("✅ Reference database seeded with 5 security standard guidelines.")
+        logger.info(f"✅ Reference database seeded with {len(documents)} security standard guidelines.")
 
-    def generate_vulnerability_report(self, flagged_functions: list[dict]) -> str:
+    def generate_vulnerability_report(
+        self,
+        flagged_functions: list[dict],
+        filename: str = "Unknown",
+        sha256_hash: str = "Unknown",
+        total_functions: int = 0
+    ) -> str:
         """
-        Retrieves reference standards and generates a comprehensive, beautiful Markdown security report
-        for the GNN-flagged functions.
+        Retrieves reference standards and generates a comprehensive, unified Markdown security report
+        for the scanned file (supporting both safe and vulnerable verdicts).
         """
         self.initialize()
 
-        if not flagged_functions:
-            return (
-                "# Sentinel AI - Security Analysis Report\n\n"
-                "## Executive Summary\n\n"
-                "**Verdict:** SAFE  \n"
-                "**Risk Level:** LOW  \n\n"
-                "Our advanced GNN (Graph Neural Network) analysis examined all function Control Flow Graphs (CFGs) "
-                "within the uploaded binary/source file. No suspicious patterns representing memory safety or "
-                "input validation vulnerabilities were flagged. The application appears compliant with standard CERT C coding rules."
-            )
+        is_vulnerable = len(flagged_functions) > 0
 
-        # Sort flagged functions by confidence and limit detailed analysis to top 10 critical ones
-        critical_functions = sorted(flagged_functions, key=lambda x: x["confidence"], reverse=True)
-        top_critical = critical_functions[:10]
-
-        # Retrieve reference guidelines for the unique set of CWE IDs flagged (reduces API calls)
+        # Retrieve reference guidelines from Chroma DB
         retrieved_docs = []
-        unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in top_critical)
-        for cwe in unique_cwes:
-            query = f"CWE memory corruption {cwe} buffer overflow out of bounds write"
-            docs = self.vector_store.similarity_search(query, k=1)
-            if docs:
-                retrieved_docs.append(docs[0].page_content)
+        if is_vulnerable:
+            # Sort flagged functions by confidence and limit detailed analysis to top 10 critical ones
+            critical_functions = sorted(flagged_functions, key=lambda x: x["confidence"], reverse=True)
+            top_critical = critical_functions[:10]
+            unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in top_critical)
+            for cwe in unique_cwes:
+                query = f"CWE memory corruption {cwe} buffer overflow out of bounds write"
+                docs = self.vector_store.similarity_search(query, k=1)
+                if docs:
+                    retrieved_docs.append(docs[0].page_content)
+        else:
+            # For safe targets, fetch a few general CERT C guidelines to display compliance standards
+            query = "CWE memory safety rules buffer overflow stack protection secure coding"
+            docs = self.vector_store.similarity_search(query, k=2)
+            for d in docs:
+                retrieved_docs.append(d.page_content)
 
         reference_context = "\n\n".join(set(retrieved_docs))
 
-        # Format details of the top flagged functions
-        functions_context = f"**Total Flagged Functions:** {len(flagged_functions)}\n"
-        if len(flagged_functions) > 10:
-            functions_context += f"*(Showing detailed security audit for the top 10 most critical findings)*\n\n"
-        
-        for idx, func in enumerate(top_critical):
-            functions_context += (
-                f"### Finding {idx + 1}: Function `{func['function_name']}`\n"
-                f"- **Model Confidence:** {func['confidence']:.2%}\n"
-                f"- **Identified Threat:** {func.get('cwe_id', 'CWE-119')} (Memory Safety / Buffer Overflow)\n"
-                f"- **Model Explanation:** {func['brief_explanation']}\n"
-                f"- **Disassembled CFG Code Blocks:**\n"
-                f"```\n{func['decompiled_code']}\n```\n\n"
+        # Format details of functions under analysis
+        if is_vulnerable:
+            functions_context = f"**Total Flagged Functions:** {len(flagged_functions)}\n"
+            if len(flagged_functions) > 10:
+                functions_context += f"*(Showing detailed security audit for the top 10 most critical findings)*\n\n"
+            for idx, func in enumerate(top_critical):
+                functions_context += (
+                    f"### Finding {idx + 1}: Function `{func['function_name']}`\n"
+                    f"- **Model Confidence:** {func['confidence']:.2%}\n"
+                    f"- **Identified Threat:** {func.get('cwe_id', 'CWE-119')} (Memory Safety / Buffer Overflow)\n"
+                    f"- **Model Explanation:** {func['brief_explanation']}\n"
+                    f"- **Disassembled CFG Code Blocks:**\n"
+                    f"```\n{func['decompiled_code']}\n```\n\n"
+                )
+        else:
+            functions_context = (
+                f"**Total Flagged Functions:** 0\n"
+                f"No functions were flagged as suspicious or vulnerable by the GNN model.\n"
+                f"All {total_functions} functions analyzed conform to the secure coding baselines."
             )
 
         prompt = f"""
-You are an expert security engineer and binary auditor. You will write a comprehensive, professional, and visually stunning vulnerability assessment report.
+You are an expert security engineer and binary auditor. You will write a comprehensive, professional, and visually stunning unified vulnerability assessment report.
 
-Below is the context retrieved from secure coding databases (SEI CERT C / CWE) and details on the functions flagged by our GNN compiler wrapper.
+Below is the context retrieved from secure coding databases (SEI CERT C / CWE) and details on the functions analyzed by our GNN compiler wrapper.
+
+### SECURITY METADATA:
+- **Filename**: {filename}
+- **SHA-256 Checksum**: {sha256_hash}
+- **Verdict**: {"VULNERABLE" if is_vulnerable else "SAFE"}
+- **Risk Level**: {"CRITICAL" if is_vulnerable else "LOW"}
+- **Total Functions Evaluated**: {total_functions}
 
 ### SECURITY STANDARDS CONTEXT:
 {reference_context}
 
-### FLAGGED FUNCTIONS TO AUDIT:
+### FUNCTIONS AUDIT CONTEXT:
 {functions_context}
 
 Please draft a gorgeous Markdown document including:
-1. A **Title**: '# Sentinel AI Security Audit Report'
-2. An **Executive Summary** with a bold verdict, overall risk level (HIGH/CRITICAL), and summary of finding count.
-3. A detailed **Vulnerability Analysis** section for each flagged function, containing:
-   - Technical breakdown of the exploit vector (how the instructions represent buffer overflows or out-of-bounds writes).
-   - The SEI CERT C coding rule violated.
-   - **Remediation & Secure Code Fix**: Provide a clear, correct rewrite of the vulnerable concept in C/C++ showing secure library usage (e.g. using `strncat` or boundary bounds checks).
-4. **General Mitigations**: Highlight best practices for compilation (canaries, DEP, ASLR) and security testing.
+1. **Title**: '# Sentinel AI Security Audit Report'
+2. **Audit Metadata Labeled List**: Display the security metadata cleanly using a bolded list (do NOT use markdown tables to ensure clean PDF compiling compatibility):
+   - **Filename**: {filename}
+   - **SHA-256 Checksum**: {sha256_hash}
+   - **Verdict**: {"VULNERABLE" if is_vulnerable else "SAFE"}
+   - **Risk Level**: {"CRITICAL" if is_vulnerable else "LOW"}
+   - **Total Functions Evaluated**: {total_functions}
+3. **Executive Summary**: Write a professional executive summary explaining the verdict and scope of the audit.
+   - For SAFE results: explain that all function Control Flow Graphs (CFGs) were checked and conform to standard coding rules.
+   - For VULNERABLE results: explain the threat vectors and the urgency of the remediation.
+4. **Analysis Metrics**: Detail the static analysis parameters, total function count, and average confidence of the checks.
+5. **Detailed Findings Section**:
+   - For SAFE results: state "No security flaws or rule violations were flagged." List the checked functions as safe.
+   - For VULNERABLE results: provide a detailed breakdown for each flagged function, containing:
+     - Technical breakdown of the exploit vector (how the instructions represent buffer overflows or out-of-bounds writes).
+     - The SEI CERT C coding rule violated.
+     - **Remediation & Secure Code Fix**: Provide a clear, correct rewrite of the vulnerable concept in C/C++ showing secure library usage (e.g. using `strncat` or boundary bounds checks).
+6. **General Mitigations**: Highlight best practices for compilation (canaries, DEP, ASLR, Control Flow Integrity) and security testing.
 
 Use strong markdown syntax, code snippets, headers, and bullet points. Make it read like a premium security consultancy report.
 """
 
         logger.info("Invoking Gemini to compile vulnerability report...")
         response = self.llm.invoke(prompt)
-        
+
         content = response.content
         if isinstance(content, list):
             content = "\n".join([str(item) if not isinstance(item, dict) else item.get("text", str(item)) for item in content])
@@ -251,6 +356,8 @@ Conversation History:
 {history_str}
 
 User's Question: {query}
+
+Important: If the conversation is already underway (i.e., Conversation History contains previous User and Assistant exchanges), do NOT greet the user, do NOT introduce yourself, and do NOT repeat your name. Address the user's question directly and concisely.
 
 Please formulate an elegant, friendly, and expert answer. Structure it with clear paragraphs or bullet points if needed. Ground your response heavily in secure C/C++ coding guidelines and explain concepts in a clear, developer-friendly manner.
 """
