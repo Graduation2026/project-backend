@@ -95,53 +95,124 @@ def is_boilerplate_or_lib(fname: str) -> bool:
         return True
     return False
 
-def verify_vulnerability_heuristic(nodes) -> bool:
+# --- Heuristic Feature Scoring (Continuous, 0.0 – 1.0) ---
+
+# Weighted risk scores for known dangerous API calls
+UNSAFE_API_WEIGHTS = {
+    "gets":    1.0,   # Unconditionally dangerous — no safe usage exists
+    "strcpy":  0.9,   # Classic buffer overflow vector
+    "strcat":  0.9,   # Unbounded concatenation
+    "sprintf": 0.7,   # Dangerous unless format-controlled
+    "scanf":   0.6,   # Dangerous with %s without width
+    "system":  0.5,   # OS command injection risk
+}
+
+# API calls that indicate safe, bounded coding practices
+SAFE_API_INDICATORS = {
+    "strncpy", "strncat", "fgets", "snprintf", "memcpy_s",
+    "memmove", "sprintf_s", "strcpy_s", "gets_s",
+    "std::", "operator<<", "operator>>", "basic_string",
+    "allocator", "length", "substr", "size",
+}
+
+# Safe alternatives that share substrings with unsafe APIs (e.g. "strncpy" contains "strcpy")
+SAFE_ALTERNATIVES = {"strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s", "gets_s"}
+
+
+def compute_heuristic_score(nodes) -> tuple[float, dict]:
     """
-    Returns True if the GNN flagged vulnerability should be kept.
-    Returns False if it is a verified safe implementation (e.g. only safe APIs, no unsafe APIs).
+    Computes a continuous heuristic vulnerability score from 0.0 (definitely safe)
+    to 1.0 (definitely vulnerable) by analyzing API calls in the disassembled CFG.
+
+    Returns:
+        (score, details): The heuristic score and a dict of found unsafe/safe calls.
     """
-    has_unsafe_call = False
-    has_safe_call = False
-    has_cpp_safe_call = False
-    
+    unsafe_hits = []     # (api_name, weight) tuples
+    safe_hit_count = 0
+    total_calls = 0
+
     for node in nodes:
         for instr in node["instructions"]:
             instr_lower = instr.lower()
-            if "call" in instr_lower or "jmp" in instr_lower:
-                # Check for unsafe functions
-                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
-                    is_safe_alternative = any(safe_alt in instr_lower for safe_alt in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
-                    if not is_safe_alternative:
-                        has_unsafe_call = True
-                
-                # Check for safe functions
-                if any(x in instr_lower for x in ["strncpy", "strncat", "fgets", "snprintf", "memcpy", "memcpy_s", "memmove"]):
-                    has_safe_call = True
-                    
-                # Check for C++ safe standard functions/operators
-                if any(x in instr_lower for x in ["std::", "operator<<", "operator>>", "basic_string", "allocator", "length", "substr", "size"]):
-                    has_cpp_safe_call = True
+            if "call" not in instr_lower and "jmp" not in instr_lower:
+                continue
 
-    if (has_safe_call or has_cpp_safe_call) and not has_unsafe_call:
-        return False # Verified Safe
-        
-    return True # Keep GNN Verdict
+            total_calls += 1
 
-def detect_vulnerability_heuristic(nodes) -> bool:
+            # Check if this is a safe alternative first (e.g. strncpy before strcpy)
+            is_safe_alt = any(sa in instr_lower for sa in SAFE_ALTERNATIVES)
+
+            # Check for unsafe API calls
+            if not is_safe_alt:
+                for api, weight in UNSAFE_API_WEIGHTS.items():
+                    if api in instr_lower:
+                        unsafe_hits.append((api, weight))
+
+            # Check for safe API indicators
+            if any(si in instr_lower for si in SAFE_API_INDICATORS):
+                safe_hit_count += 1
+
+    # Compute the score
+    if not unsafe_hits and safe_hit_count == 0:
+        # No recognizable API calls → heuristic is neutral (0.5 = "I don't know")
+        return 0.5, {"unsafe": [], "safe_count": 0, "verdict": "neutral"}
+
+    if unsafe_hits:
+        # Take the max risk weight among all detected unsafe calls
+        max_risk = max(w for _, w in unsafe_hits)
+        # Scale up slightly if multiple different unsafe APIs are found
+        unique_unsafe = len(set(api for api, _ in unsafe_hits))
+        multi_penalty = min(0.1 * (unique_unsafe - 1), 0.1)  # +0.1 max for variety
+        raw_score = min(max_risk + multi_penalty, 1.0)
+
+        # If safe APIs are also present, dampen the score slightly
+        # (the function may be partially patched)
+        if safe_hit_count > 0:
+            dampen = 0.1 * min(safe_hit_count, 3)  # Up to -0.3
+            raw_score = max(raw_score - dampen, 0.4)
+
+        return raw_score, {
+            "unsafe": [(api, w) for api, w in unsafe_hits],
+            "safe_count": safe_hit_count,
+            "verdict": "vulnerable"
+        }
+    else:
+        # Only safe calls found, no unsafe calls → lean safe
+        safe_score = max(0.1, 0.4 - 0.1 * min(safe_hit_count, 3))
+        return safe_score, {
+            "unsafe": [],
+            "safe_count": safe_hit_count,
+            "verdict": "safe"
+        }
+
+
+def ensemble_gnn_heuristic(gnn_vuln_prob: float, heuristic_score: float,
+                           gnn_weight_base: float = 0.65) -> float:
     """
-    Returns True if the function contains known unsafe calls without safe alternatives,
-    indicating it should be classified as Vulnerable regardless of GNN score.
+    Combines GNN probability and heuristic score using confidence-weighted ensembling.
+
+    When the GNN is confident (far from 0.5), it dominates the final score.
+    When the GNN is uncertain (near 0.5), the heuristic has more influence.
+
+    Args:
+        gnn_vuln_prob:   GNN's raw softmax probability for the 'vulnerable' class (0–1).
+        heuristic_score: Heuristic vulnerability score (0–1).
+        gnn_weight_base: Base weight for the GNN (default 0.65 = GNN is always primary).
+
+    Returns:
+        Final blended vulnerability probability (0–1).
     """
-    has_unsafe_call = False
-    for node in nodes:
-        for instr in node["instructions"]:
-            instr_lower = instr.lower()
-            if "call" in instr_lower or "jmp" in instr_lower:
-                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
-                    is_safe_alternative = any(safe_alt in instr_lower for safe_alt in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
-                    if not is_safe_alternative:
-                        has_unsafe_call = True
-    return has_unsafe_call
+    # GNN confidence: 0.0 when GNN is at 0.5 (uncertain), 1.0 when at 0.0 or 1.0
+    gnn_confidence = abs(gnn_vuln_prob - 0.5) * 2.0
+
+    # Scale GNN weight: from gnn_weight_base (when uncertain) up to ~0.90 (when confident)
+    gnn_weight = gnn_weight_base + (1.0 - gnn_weight_base) * gnn_confidence * 0.7
+    heuristic_weight = 1.0 - gnn_weight
+
+    final_prob = gnn_weight * gnn_vuln_prob + heuristic_weight * heuristic_score
+
+    # Clamp to [0.01, 0.99] to avoid absolute certainty claims
+    return max(0.01, min(0.99, final_prob))
 
 
 class VulnerabilityPredictor:
@@ -270,23 +341,28 @@ class VulnerabilityPredictor:
                     vuln_prob = float(probs[1])
                     safe_prob = float(probs[0])
 
+                # --- Confidence-Weighted Ensemble ---
+                # Step 1: Get raw GNN prediction
+                raw_gnn_vuln = vuln_prob
+
+                # Step 2: Get continuous heuristic score
+                heuristic_score, heuristic_details = compute_heuristic_score(nodes)
+
+                # Step 3: Blend via confidence-weighted ensemble
+                vuln_prob = ensemble_gnn_heuristic(raw_gnn_vuln, heuristic_score)
+                safe_prob = 1.0 - vuln_prob
                 is_vuln = vuln_prob > 0.5
-                
-                # Apply heuristic verification override
-                if is_vuln:
-                    if not verify_vulnerability_heuristic(nodes):
-                        # Override GNN decision to Safe!
-                        vuln_prob = 0.30
-                        safe_prob = 0.70
-                        is_vuln = False
-                else:
-                    if detect_vulnerability_heuristic(nodes):
-                        # Override GNN decision to Vulnerable!
-                        vuln_prob = 0.85
-                        safe_prob = 0.15
-                        is_vuln = True
-                
                 confidence = vuln_prob if is_vuln else safe_prob
+
+                # Log disagreements for analysis
+                gnn_verdict = "Vulnerable" if raw_gnn_vuln > 0.5 else "Safe"
+                final_verdict = "Vulnerable" if is_vuln else "Safe"
+                if gnn_verdict != final_verdict:
+                    logger.info(
+                        f"  ⚖ Ensemble adjusted {fname}: GNN={raw_gnn_vuln:.3f} "
+                        f"Heuristic={heuristic_score:.3f} → Final={vuln_prob:.3f} "
+                        f"({gnn_verdict}→{final_verdict}) | {heuristic_details}"
+                    )
 
             # Formulate decompiled / disassembled preview for RAG context
             decompiled_lines = []
