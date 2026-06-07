@@ -106,7 +106,32 @@ public class ExtractAllCFGs extends GhidraScript {
                 InstructionIterator instrIter = listing.getInstructions(block, true);
                 while (instrIter.hasNext()) {
                     Instruction instr = instrIter.next();
-                    instructions.add(instr.toString());
+                    String instrStr = instr.toString();
+                    
+                    Address[] flowAddrs = instr.getFlows();
+                    if (flowAddrs != null && flowAddrs.length > 0) {
+                        Address target = flowAddrs[0];
+                        Function targetFunc = currentProgram.getFunctionManager().getFunctionAt(target);
+                        if (targetFunc != null) {
+                            instrStr += " // " + targetFunc.getName();
+                        } else {
+                            ghidra.program.model.symbol.Symbol sym = currentProgram.getSymbolTable().getPrimarySymbol(target);
+                            if (sym != null) {
+                                instrStr += " // " + sym.getName();
+                            }
+                        }
+                    } else {
+                        ghidra.program.model.symbol.Reference[] refs = instr.getReferencesFrom();
+                        if (refs != null && refs.length > 0) {
+                            Address target = refs[0].getToAddress();
+                            ghidra.program.model.symbol.Symbol sym = currentProgram.getSymbolTable().getPrimarySymbol(target);
+                            if (sym != null) {
+                                instrStr += " // " + sym.getName();
+                            }
+                        }
+                    }
+                    
+                    instructions.add(instrStr);
                 }
 
                 JsonObject node = new JsonObject();

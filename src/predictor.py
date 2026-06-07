@@ -56,6 +56,94 @@ class VulnGNN(torch.nn.Module):
         return x
 
 
+# --- Boilerplate Symbol Blacklist ---
+BOILERPLATE_BLACKLIST = {
+    # MinGW CRT & Windows Startup
+    "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init",
+    "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
+    "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
+    "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
+    # Linux ELF Startup
+    "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
+    "__libc_csu_fini", "_dl_relocate_static_pie",
+}
+
+CPP_LIB_KEYWORDS = {
+    "length", "size", "begin", "end", "empty", "c_str", "compare", "clear",
+    "push_back", "pop_back", "append", "assign", "insert", "erase", "replace",
+    "find", "rfind", "substr", "at", "operator[]", "capacity", "reserve",
+    "shrink_to_fit", "front", "back", "data", "get_allocator", "swap", "eq",
+    "operator<<", "operator>>", "~string", "~_Guard", "_M_dispose", "_Alloc_hider",
+    "__throw_logic_error", "_M_construct", "__new_allocator", "~__new_allocator",
+    "__is_constant_evaluated", "_M_local_data", "_Alloc_hider", "_M_construct",
+    "__throw_out_of_range_fmt"
+}
+
+def is_boilerplate_or_lib(fname: str) -> bool:
+    # Check exact matches
+    if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS:
+        return True
+    # Check prefixes/substrings for compiler boilerplate
+    if fname.startswith("__") or fname.startswith("_Z") or fname.startswith("glob"):
+        if not (fname.startswith("__main") or fname.startswith("main")):
+            if any(x in fname for x in ["CRT", "mingw", "tm_clones", "frame_dummy"]):
+                return True
+            if fname.startswith("_Z"): # C++ mangled names
+                if any(x in fname for x in ["std::", "NSt7", "allocator", "basic_string", "string"]):
+                    return True
+    if any(x in fname for x in ["std::", "std::allocator", "std::basic_string", "~_Guard", "basic_string"]):
+        return True
+    return False
+
+def verify_vulnerability_heuristic(nodes) -> bool:
+    """
+    Returns True if the GNN flagged vulnerability should be kept.
+    Returns False if it is a verified safe implementation (e.g. only safe APIs, no unsafe APIs).
+    """
+    has_unsafe_call = False
+    has_safe_call = False
+    has_cpp_safe_call = False
+    
+    for node in nodes:
+        for instr in node["instructions"]:
+            instr_lower = instr.lower()
+            if "call" in instr_lower or "jmp" in instr_lower:
+                # Check for unsafe functions
+                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
+                    is_safe_alternative = any(safe_alt in instr_lower for safe_alt in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
+                    if not is_safe_alternative:
+                        has_unsafe_call = True
+                
+                # Check for safe functions
+                if any(x in instr_lower for x in ["strncpy", "strncat", "fgets", "snprintf", "memcpy", "memcpy_s", "memmove"]):
+                    has_safe_call = True
+                    
+                # Check for C++ safe standard functions/operators
+                if any(x in instr_lower for x in ["std::", "operator<<", "operator>>", "basic_string", "allocator", "length", "substr", "size"]):
+                    has_cpp_safe_call = True
+
+    if (has_safe_call or has_cpp_safe_call) and not has_unsafe_call:
+        return False # Verified Safe
+        
+    return True # Keep GNN Verdict
+
+def detect_vulnerability_heuristic(nodes) -> bool:
+    """
+    Returns True if the function contains known unsafe calls without safe alternatives,
+    indicating it should be classified as Vulnerable regardless of GNN score.
+    """
+    has_unsafe_call = False
+    for node in nodes:
+        for instr in node["instructions"]:
+            instr_lower = instr.lower()
+            if "call" in instr_lower or "jmp" in instr_lower:
+                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
+                    is_safe_alternative = any(safe_alt in instr_lower for safe_alt in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
+                    if not is_safe_alternative:
+                        has_unsafe_call = True
+    return has_unsafe_call
+
+
 class VulnerabilityPredictor:
     """
     Singleton predictor that loads Word2Vec and GNN models on first use.
@@ -145,7 +233,9 @@ class VulnerabilityPredictor:
             for node in nodes:
                 node_vecs = []
                 for instr in node["instructions"]:
-                    parts = instr.replace(",", " ").replace("[", " ").replace("]", " ").split()
+                    # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
+                    instr_clean = instr.split("//")[0]
+                    parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
                     valid_parts = [p for p in parts if p in w2v.wv]
                     if valid_parts:
                         vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
@@ -165,16 +255,38 @@ class VulnerabilityPredictor:
             else:
                 edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
 
-            # Run GNN model
-            batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
-            with torch.no_grad():
-                out = self._gnn_model(x, edge_index, batch)
-                probs = torch.softmax(out, dim=1)[0]
-                vuln_prob = float(probs[1])
-                safe_prob = float(probs[0])
+            # Check if symbol is compiler boilerplate
+            if is_boilerplate_or_lib(fname):
+                vuln_prob = 0.0
+                safe_prob = 1.0
+                is_vuln = False
+                confidence = 1.0
+            else:
+                # Run GNN model
+                batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
+                with torch.no_grad():
+                    out = self._gnn_model(x, edge_index, batch)
+                    probs = torch.softmax(out, dim=1)[0]
+                    vuln_prob = float(probs[1])
+                    safe_prob = float(probs[0])
 
-            is_vuln = vuln_prob > 0.5
-            confidence = vuln_prob if is_vuln else safe_prob
+                is_vuln = vuln_prob > 0.5
+                
+                # Apply heuristic verification override
+                if is_vuln:
+                    if not verify_vulnerability_heuristic(nodes):
+                        # Override GNN decision to Safe!
+                        vuln_prob = 0.30
+                        safe_prob = 0.70
+                        is_vuln = False
+                else:
+                    if detect_vulnerability_heuristic(nodes):
+                        # Override GNN decision to Vulnerable!
+                        vuln_prob = 0.85
+                        safe_prob = 0.15
+                        is_vuln = True
+                
+                confidence = vuln_prob if is_vuln else safe_prob
 
             # Formulate decompiled / disassembled preview for RAG context
             decompiled_lines = []
