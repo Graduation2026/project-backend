@@ -17,6 +17,7 @@ import json
 import logging
 import shutil
 import subprocess
+import uuid
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -56,17 +57,42 @@ def compile_source(source_path: Path, output_o_path: Path) -> Path:
     """
     Compiles a C/C++ source file into a relocatable object file (.o)
     using MinGW GCC/G++, supporting standalone functions without main().
+    Handles .h/.hpp files by converting inline/static definitions into standard
+    global symbols so the compiler emits code bodies.
     """
     file_ext = source_path.suffix.lower()
-    compiler = "g++" if file_ext in [".cpp", ".cc", ".cxx", ".hpp"] else "gcc"
+    is_header = file_ext in [".h", ".hpp"]
     
-    # Run compiler: gcc -O0 -g -c -o output_o_path source_path
-    command = [compiler, "-O0", "-g", "-c", "-o", str(output_o_path), str(source_path)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        raise Exception(f"MinGW compilation failed:\n{result.stderr}")
+    temp_source_path = source_path
+    if is_header:
+        # Read header content
+        with open(source_path, "r", encoding="utf-8", errors="ignore") as f:
+            code = f.read()
         
+        # Replace static inline / inline with empty space so the compiler emits symbols
+        import re
+        code_modified = re.sub(r'\bstatic\s+inline\b', ' ', code)
+        code_modified = re.sub(r'\binline\b', ' ', code_modified)
+        
+        # Create temp source file
+        temp_suffix = ".cpp" if file_ext == ".hpp" else ".c"
+        temp_source_path = source_path.parent / f"temp_hdr_compile_{uuid.uuid4().hex}{temp_suffix}"
+        with open(temp_source_path, "w", encoding="utf-8") as f:
+            f.write(code_modified)
+
+    try:
+        compiler = "g++" if temp_source_path.suffix.lower() == ".cpp" else "gcc"
+        # Compile: gcc/g++ -O0 -g -c -o output_o_path temp_source_path
+        command = [compiler, "-O0", "-g", "-c", "-o", str(output_o_path), str(temp_source_path)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise Exception(f"MinGW compilation failed:\n{result.stderr}")
+    finally:
+        # Always clean up temp source file if it was created
+        if is_header and temp_source_path.exists():
+            temp_source_path.unlink()
+            
     return output_o_path
 
 
