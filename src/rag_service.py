@@ -56,16 +56,16 @@ class RAGService:
         logger.info("✅ RAG Service initialized successfully.")
 
     def seed_db_if_empty(self):
-        """Pre-loads standard CWE security guidelines and CERT C coding standards into ChromaDB."""
+        """Pre-loads standard CWE security guidelines, CERT C coding standards, compiler defenses, and exploit mechanics into ChromaDB."""
         # Check if vector store is already populated (simple count check)
         try:
             count = len(self.vector_store.get()["ids"])
         except Exception:
             count = 0
 
-        # We have 12 documents now (5 original + 4 new CWEs + 3 non-CWE helper guides)
+        # We have 21 documents now for full threat intelligence coverage
         if count > 0:
-            if count >= 12:
+            if count >= 21:
                 logger.info(f"Reference database already seeded with {count} documents.")
                 return
             else:
@@ -75,17 +75,17 @@ class RAGService:
                 except Exception as e:
                     logger.warning(f"Failed to clear collection: {e}")
 
-        logger.info("Seeding Reference database with security guidelines...")
+        logger.info("Seeding Reference database with extensive threat intelligence guidelines...")
         reference_data = [
             {
                 "content": (
                     "CWE-120: Buffer Copy without Checking Size of Input ('Classic Buffer Overflow'). "
                     "This occurs when the program copies an input buffer to a destination buffer without "
-                    "verifying that the destination has enough space. Dangers of strcat: The standard strcat(dest, src) "
-                    "appends src to dest without bounds checking. If the input exceeds buffer boundaries, it overflows "
-                    "the stack, leading to memory corruption, program crash, or execution hijacking. "
+                    "verifying that the destination has enough space. Dangers of strcat/strcpy: The standard copy "
+                    "APIs append src to dest without bounds checking. If input exceeds target boundaries, it overflows "
+                    "memory, leading to corruption, program crashes, or code hijacking. "
                     "CERT C Rule STR31-C: Guarantee that storage for strings has sufficient space for character data "
-                    "and the null terminator. Mitigation: Use bounded copy functions like strncat(dest, src, sizeof(dest) - strlen(dest) - 1) "
+                    "and the null terminator. Mitigation: Use bounded copy functions like strncat or snprintf, "
                     "or perform explicit size checks before copying string characters."
                 ),
                 "metadata": {"cwe": "CWE-120", "type": "Buffer Overflow", "standard": "CERT C STR31-C"}
@@ -93,10 +93,11 @@ class RAGService:
             {
                 "content": (
                     "CWE-121: Stack-based Buffer Overflow. A stack-based buffer overflow condition exists when a buffer "
-                    "allocated on the stack has data written to it that is larger than the buffer. This can corrupt "
-                    "the function's stack frame, overwrite local variables, and hijack the instruction pointer (EIP/RIP) "
-                    "upon function return. Commonly caused by gets(), strcpy(), strcat(), or unchecked copy loops. "
-                    "CERT C Rule STR31-C / ARR30-C: Formulate bounds checks on all buffers. "
+                    "allocated on the stack has data written to it that is larger than the buffer. This corrupts "
+                    "the function's stack frame, overwrites local variables, and overwrites the saved instruction pointer "
+                    "(saved EBP/RBP and return EIP/RIP address) upon function return, enabling execution hijack. "
+                    "Commonly caused by gets(), strcpy(), strcat(), or unchecked loop copies. "
+                    "CERT C Rule ARR30-C: Formulate bounds checks on all buffers. "
                     "Mitigation: Avoid gets() entirely (use fgets instead). Ensure target buffer size is larger than the input "
                     "data size using pre-conditions or bounds checks. Enable compiler protections like stack canaries (-fstack-protector)."
                 ),
@@ -105,7 +106,7 @@ class RAGService:
             {
                 "content": (
                     "CWE-787: Out-of-bounds Write. The software writes data past the end, or before the beginning, of the "
-                    "intended buffer. This can lead to heap corruption, local variable overwrite, or system crash. "
+                    "intended buffer. This can lead to heap corruption, stack variable overwrite, or system crash. "
                     "Common in manual pointer arithmetic or custom memory copy loops without boundary assertions. "
                     "CERT C Rule ARR30-C: Do not form or use out-of-bounds pointers or array subscripts. "
                     "Mitigation: Always check boundaries. Use secure memory API wrappers. Validate that pointer offsets "
@@ -117,8 +118,8 @@ class RAGService:
                 "content": (
                     "CWE-134: Use of Externally-Controlled Format String. The software uses input from an external source "
                     "as the format string argument in formatted output functions like printf, sprintf, fprintf, syslog. "
-                    "Attackers can leverage format specifiers (e.g., %x, %s, %n) to dump stack memory or overwrite "
-                    "arbitrary memory locations, leading to full code execution. "
+                    "Attackers can leverage format specifiers (e.g., %x, %s, %n) to dump stack memory, read arbitrary addresses, "
+                    "or write data to arbitrary memory locations (using %n), leading to full code execution. "
                     "CERT C Rule FIO30-C: Exclude user input from format strings. "
                     "Mitigation: Always write formatted functions using explicit specifiers, e.g., use printf(\"%s\", user_input) "
                     "instead of printf(user_input)."
@@ -129,7 +130,7 @@ class RAGService:
                 "content": (
                     "CWE-416: Use After Free. Referencing memory after it has been freed can lead to undefined behavior, "
                     "program crash, or arbitrary code execution (especially if an attacker re-allocates that same heap block "
-                    "to a controlled object structure). "
+                    "to a controlled object structure, altering virtual tables or function pointers). "
                     "CERT C Rule MEM30-C: Do not access freed memory. "
                     "Mitigation: After calling free(ptr), immediately assign ptr = NULL. This ensures any subsequent access "
                     "fails immediately with a null pointer dereference rather than silently corrupting memory or enabling exploits."
@@ -138,7 +139,7 @@ class RAGService:
             },
             {
                 "content": (
-                    "CWE-190: Integer Overflow or Wraparound. Occurs when a math operation produces a value outside the range "
+                    "CWE-190: Integer Overflow or Wraparound. Occurs when an integer arithmetic operation produces a value outside the range "
                     "that can be stored in the integer type. In C, if an integer overflow occurs during memory allocation "
                     "calculations (like malloc(size * count)), it can wrap around to a very small number, causing malloc to "
                     "allocate a tiny buffer while the program still writes the full amount of data, leading to a heap-based buffer overflow. "
@@ -181,30 +182,112 @@ class RAGService:
             },
             {
                 "content": (
-                    "Compiler Hardening Defenses & Binary Protections. Mitigating exploitation in compiled binaries requires "
-                    "compiler-enforced flags: Stack Canaries (-fstack-protector-strong) place guard values on the stack to detect overflows "
-                    "before returning. DEP/NX (Data Execution Prevention / No-Execute) marks data segments as non-executable to prevent shellcode injection. "
-                    "ASLR (Address Space Layout Randomization) compiled with -fPIE -pie randomizes address layouts. Full RELRO (-Wl,-z,relro,-z,now) "
-                    "makes global offset tables read-only to prevent redirection hooks."
+                    "Difference Between CWE-120 and CWE-121. CWE-120 (Buffer Copy without Checking Size of Input) is the general "
+                    "flaw of performing a copy operation without verifying that the target buffer is large enough; it represents "
+                    "the copy *action* and can occur on the heap, stack, or static memory segments. CWE-121 (Stack-based Buffer Overflow) "
+                    "specifically designates that the destination buffer is located on the stack, which directly threatens stack-frame structures, "
+                    "saved registers (EBP/RBP), and the function return address."
                 ),
-                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "Binary Hardening"}
+                "metadata": {"cwe": "General", "type": "CWE Comparison", "standard": "CWE-120 vs CWE-121"}
             },
             {
                 "content": (
-                    "Exploitation Mechanics and Code Vulnerability Consequences. Memory safety bugs lead to exploit vectors: Stack Smashing "
-                    "overwrites the saved instruction pointer (EIP/RIP) to redirect control. Return-Oriented Programming (ROP) chains execute "
-                    "snippets of code (gadgets) already in memory to bypass DEP. Heap sprays flood memory to guide execution flow. "
-                    "Understanding these consequences helps engineers prioritize remediation of buffer copies and out-of-bounds writes."
+                    "CERT C String Safety Guide (STR30-C / STR31-C / STR32-C). Rule STR30-C: Do not attempt to modify string literals "
+                    "(as they reside in read-only memory and cause instant undefined behavior or crashes). Rule STR31-C: Guarantee "
+                    "that storage for strings has sufficient space for character data and the null terminator. Rule STR32-C: Null-terminate "
+                    "all strings returned from legacy string manipulation APIs to prevent out-of-bounds reads during printing or string operations."
                 ),
-                "metadata": {"cwe": "General", "type": "Exploitation Mechanics", "standard": "Exploit Context"}
+                "metadata": {"cwe": "General", "type": "String Standards", "standard": "CERT C Strings"}
             },
             {
                 "content": (
-                    "Secure Library Alternatives & API replacements. Legacy C functions (strcpy, strcat, sprintf, gets) should be replaced "
-                    "with safe, bounded variants. Use strncpy or strlcpy for copying, strncat for concatenation, snprintf for formatted printing, "
-                    "and fgets for line input. Always verify that strings are null-terminated and explicitly validate sizes against destination bounds."
+                    "CERT C Array Safety Guide (ARR30-C / ARR38-C). Rule ARR30-C: Do not form or use out-of-bounds pointers or "
+                    "array subscripts. Indexing arrays outside of [0, size-1] is undefined behavior. Rule ARR38-C: Do not perform "
+                    "pointer arithmetic that results in a pointer outside the bounds of the allocated array. Always verify that "
+                    "pointer bounds remain within their allocation segment before dereferencing."
                 ),
-                "metadata": {"cwe": "General", "type": "API Alternatives", "standard": "Secure APIs"}
+                "metadata": {"cwe": "General", "type": "Array Standards", "standard": "CERT C Arrays"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening - Stack Canaries. A compiler-enforced binary defense against stack smashing. The compiler "
+                    "places a random guard value (canary) on the stack frame between local buffers and the saved return pointer (EBP/RIP). "
+                    "Before returning, the function verifies that the canary value is unaltered. If an overflow has overwritten "
+                    "it, the program aborts immediately, preventing RIP hijack. Enabled in GCC via -fstack-protector-strong or -fstack-protector-all."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "Stack Canaries"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening - ASLR & PIE. Address Space Layout Randomization (ASLR) is an OS security defense that randomizes "
+                    "the memory offsets where the stack, heap, and shared libraries are loaded. To enable this defense for the binary "
+                    "code segment itself, the program must be compiled as a Position Independent Executable (PIE) using GCC flags -fPIE -pie. "
+                    "This prevents attackers from relying on fixed, hardcoded function addresses in memory."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "ASLR & PIE"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening - RELRO. RElocation Read-Only (RELRO) is a security feature to protect the Global Offset Table "
+                    "(GOT) from binary hijacking. Partial RELRO makes binary sections read-only after dynamic loading. Full RELRO (using GCC "
+                    "flags -Wl,-z,relro,-z,now) forces the dynamic linker to resolve all symbols at program startup and marks the entire "
+                    "GOT section as completely read-only, preventing attackers from overwriting GOT addresses to hook functions."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "RELRO"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening - DEP/NX. Data Execution Prevention (DEP), also known as No-Execute (NX), is a hardware-supported "
+                    "memory protection. It marks data memory segments (such as the stack, heap, and BSS) as non-executable. If execution "
+                    "is redirected to shellcode stored in these data segments, the CPU immediately triggers an execution fault, preventing "
+                    "direct code execution payloads."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "DEP/NX"}
+            },
+            {
+                "content": (
+                    "Compiler Hardening - Fortify Source. Fortify Source (-D_FORTIFY_SOURCE=2) is a GCC feature that replaces standard "
+                    "unbounded string and memory copy functions (like strcpy, memcpy) with bounded checker wrappers (like __strcpy_chk) "
+                    "at compile-time and runtime. If the compiler can deduce the buffer size, it inserts runtime boundary verification "
+                    "checks that abort execution if an overflow occurs. Enforced via gcc -O2 -D_FORTIFY_SOURCE=2."
+                ),
+                "metadata": {"cwe": "General", "type": "Compiler Protections", "standard": "Fortify Source"}
+            },
+            {
+                "content": (
+                    "Exploitation Mechanics - Stack Smashing. A technique where an attacker exploits a stack-based buffer overflow (CWE-121) "
+                    "to write data past stack buffer bounds, overwriting local variables, the frame pointer (saved EBP/RBP), and the saved "
+                    "return instruction pointer (saved EIP/RIP). When the function returns (executes RET), the CPU pops the hijacked return address "
+                    "off the stack and jumps to attacker-controlled memory."
+                ),
+                "metadata": {"cwe": "General", "type": "Exploitation Mechanics", "standard": "Stack Smashing"}
+            },
+            {
+                "content": (
+                    "Exploitation Mechanics - Return-Oriented Programming (ROP). An advanced exploit technique used to bypass DEP/NX. "
+                    "Instead of executing injected shellcode in data memory, the attacker chains small assembly snippets ('gadgets') "
+                    "already present in executable memory (such as libc or the binary code segment). Each gadget performs a small operation "
+                    "and ends with a ret instruction, popping the next gadget address off the stack to execute arbitrary commands."
+                ),
+                "metadata": {"cwe": "General", "type": "Exploitation Mechanics", "standard": "ROP Gadgets"}
+            },
+            {
+                "content": (
+                    "Exploitation Mechanics - UAF & Heap Hijacking. Exploiting Use After Free (CWE-416) involves heap memory reallocation. "
+                    "When a chunk is freed, its memory block is placed in allocator bins. Attackers re-allocate that block to hold another "
+                    "structure of similar size (e.g., an object with function pointers or virtual tables). Re-using the dangling pointer triggers "
+                    "execution of the attacker's payload."
+                ),
+                "metadata": {"cwe": "General", "type": "Exploitation Mechanics", "standard": "UAF Hijacking"}
+            },
+            {
+                "content": (
+                    "Assembly Threat Auditing & Register Mechanics. Key registers: ESP/RSP (Stack Pointer pointing to the top of the stack), "
+                    "EBP/RBP (Base Frame Pointer pointing to the bottom of the stack frame), EAX/RAX (Accumulator register, holds return "
+                    "values and syscall codes). Dangerous instructions: jmp esp (classic stack execution pivot), call eax (indirect function call "
+                    "vulnerable to hijack), int 0x80 / syscall (triggers kernel-level system trap calls)."
+                ),
+                "metadata": {"cwe": "General", "type": "Assembly Analysis", "standard": "Register Mechanics"}
             }
         ]
 
