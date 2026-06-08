@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     volumes:
       - sentinel-temp:/app/temp
+    env_file:
+      - .env
     environment:
       - GHIDRA_INSTALL_DIR=/opt/ghidra
       - FEATURES_DIR=/app/temp/features

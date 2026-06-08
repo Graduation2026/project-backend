@@ -8,7 +8,10 @@ Handles:
 """
 
 import logging
+import os
+import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -28,6 +31,37 @@ logger = logging.getLogger(__name__)
 class GhidraError(Exception):
     """Raised when Ghidra analysis fails."""
     pass
+
+
+# Simple file lock to prevent duplicate concurrent analysis of the same binary
+_LOCK_DIR = None
+
+def _get_lock_dir():
+    global _LOCK_DIR
+    if _LOCK_DIR is None:
+        _LOCK_DIR = Path(tempfile.mkdtemp(prefix="ghidra_locks_"))
+    return _LOCK_DIR
+
+def _acquire_binary_lock(binary_path: Path) -> str:
+    """Create a lock file for the binary's canonical path to prevent duplicate concurrent analysis."""
+    lock_dir = _get_lock_dir()
+    lock_name = "lock_" + binary_path.resolve().as_posix().replace("/", "_").replace(":", "") + ".lock"
+    lock_path = lock_dir / lock_name
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL)
+        os.close(fd)
+        return str(lock_path)
+    except FileExistsError:
+        raise GhidraError(
+            f"Binary '{binary_path.name}' is already being analyzed. "
+            "Please wait for the current analysis to complete."
+        )
+
+def _release_binary_lock(lock_path: str):
+    try:
+        Path(lock_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def run_ghidra_analysis(binary_path: Path) -> Path:
@@ -56,9 +90,19 @@ def run_ghidra_analysis(binary_path: Path) -> Path:
     if not binary_path.exists():
         raise FileNotFoundError(f"Binary file not found: {binary_path}")
 
-    # Create a unique project name to avoid collisions
+    # Acquire binary lock to prevent duplicate concurrent analysis of same file
+    lock_path = _acquire_binary_lock(binary_path)
+
+    # Each analysis gets a unique session with isolated temp directories
+    # The -deleteProject flag cleans up the Ghidra project after analysis
+    # Per-session temp dirs ensure concurrent analyses on different files never collide
     session_id = uuid.uuid4().hex[:8]
     project_name = f"InferenceProject_{session_id}"
+
+    # Use per-session temp directories to avoid collisions
+    session_temp_dir = Path(tempfile.mkdtemp(prefix=f"ghidra_{session_id}_"))
+    session_project_dir = session_temp_dir / "project"
+    session_project_dir.mkdir(parents=True, exist_ok=True)
 
     # Create a unique output directory for this analysis
     output_dir = GHIDRA_OUTPUT_DIR / session_id
@@ -77,10 +121,10 @@ def run_ghidra_analysis(binary_path: Path) -> Path:
     #        route the graph structures to our high-performance GNN!
     # =========================================================================
     
-    # Build the analyzeHeadless command
+    # Build the analyzeHeadless command using session-scoped temp project dir
     cmd = [
         str(GHIDRA_HEADLESS),
-        str(GHIDRA_PROJECT_DIR),         # Where Ghidra stores its temp project
+        str(session_project_dir),        # Per-session temp project directory
         project_name,                     # Temporary project name
         "-import", str(binary_path),      # The binary to analyze
         "-scriptPath", str(GHIDRA_SCRIPT_DIR),  # Where our Java script lives
@@ -97,7 +141,7 @@ def run_ghidra_analysis(binary_path: Path) -> Path:
             capture_output=True,
             text=True,
             timeout=GHIDRA_TIMEOUT_SECONDS,
-            cwd=str(GHIDRA_PROJECT_DIR),
+            cwd=str(session_project_dir),
         )
 
         # Log Ghidra output for debugging
@@ -120,6 +164,11 @@ def run_ghidra_analysis(binary_path: Path) -> Path:
             "Failed to execute analyzeHeadless.bat. "
             "Make sure Java 17+ is installed and in your PATH."
         )
+    finally:
+        # Release binary lock
+        _release_binary_lock(lock_path)
+        # Clean up session temp directory
+        shutil.rmtree(session_temp_dir, ignore_errors=True)
 
     if not output_json_path.exists():
         raise GhidraError(

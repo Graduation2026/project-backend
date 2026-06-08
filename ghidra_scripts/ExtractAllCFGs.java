@@ -42,8 +42,10 @@ public class ExtractAllCFGs extends GhidraScript {
             Function func = funcIter.next();
             String fname = func.getName();
 
-            // Skip default external or library functions to focus on program code
-            if (func.isThunk() || fname.startsWith("sys_") || fname.startsWith("__") || fname.startsWith("_")) {
+            // Skip thunks and compiler-internal symbols (double-underscore),
+            // but allow single-underscore names — object files (.o) use them
+            // for ALL user functions (e.g. _main, _vulnerable_function).
+            if (func.isThunk() || fname.startsWith("__") || fname.startsWith("sys_")) {
                 continue;
             }
 
@@ -142,8 +144,9 @@ public class ExtractAllCFGs extends GhidraScript {
                 blockIndex++;
             }
 
-            // Skip empty functions or too small/large functions during indexing
-            if (blockIndex < 2 || blockIndex > 200) {
+            // Skip empty functions (0 blocks = extraction failed) or very large functions (200+ blocks = likely data)
+            // Single-block functions ARE included — they can contain dangerous calls like gets()
+            if (blockIndex < 1 || blockIndex > 200) {
                 continue;
             }
 

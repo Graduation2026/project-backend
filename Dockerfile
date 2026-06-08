@@ -23,7 +23,8 @@ RUN wget --progress=dot:giga https://github.com/NationalSecurityAgency/ghidra/re
 
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
-# Install Python requirements
+# Install PyTorch (CPU) first, then remaining requirements
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

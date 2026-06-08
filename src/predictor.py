@@ -1,12 +1,25 @@
 """
-predictor.py — GNN inference module for vulnerability prediction.
+predictor.py — Hybrid GNN + Heuristic Vulnerability Prediction Engine.
 
-Loads the trained Word2Vec model and PyTorch Geometric GNN model,
-then disassembles instructions to node embeddings and runs GATv2 model inference.
+Architecture:
+  This module implements a confidence-weighted ensemble of two complementary approaches:
+  1. GNN (GATv2): Graph Attention Network analyzes Control Flow Graphs (CFGs) extracted
+     by Ghidra, learning structural patterns of vulnerable vs safe code.
+  2. Heuristic Scorer: Continuous API-call analysis using weighted risk scoring for known
+     unsafe/safe function patterns.
+
+  The ensemble dynamically adjusts weights based on GNN confidence:
+  - When GNN is confident (far from 0.5), it dominates the final score
+  - When GNN is uncertain (near 0.5), the heuristic has more influence
+
+  This hybrid design leverages GNN pattern recognition for novel vulnerabilities while
+  maintaining precision on known vulnerability patterns via expert-defined heuristics.
 """
 
 import json
 import logging
+import re
+import threading
 from pathlib import Path
 import numpy as np
 import torch
@@ -56,7 +69,20 @@ class VulnGNN(torch.nn.Module):
         return x
 
 
-# --- Boilerplate Symbol Blacklist ---
+# --- Boilerplate Symbol Filter ---
+# Set to False to disable filtering entirely (all functions analyzed)
+BOILERPLATE_FILTER_ENABLED = True
+
+# Regex patterns for auto-generated compiler/linker labels
+BOILERPLATE_REGEX = [
+    re.compile(r'^_?GLOBAL_'),          # GCC global init
+    re.compile(r'^_?sub_'),             # IDA Pro default names
+    re.compile(r'^_?LABEL_'),           # Compiler-generated labels
+    re.compile(r'^_?loc_[0-9a-f]'),     # Ghidra/IDA location labels
+    re.compile(r'^_?L[C$]\d+'),         # Windows CRT labels
+    re.compile(r'^_?\.L[BC]\d+'),       # GCC local labels
+]
+
 BOILERPLATE_BLACKLIST = {
     # MinGW CRT & Windows Startup
     "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init",
@@ -80,6 +106,8 @@ CPP_LIB_KEYWORDS = {
 }
 
 def is_boilerplate_or_lib(fname: str) -> bool:
+    if not BOILERPLATE_FILTER_ENABLED:
+        return False
     # Check exact matches
     if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS:
         return True
@@ -93,9 +121,23 @@ def is_boilerplate_or_lib(fname: str) -> bool:
                     return True
     if any(x in fname for x in ["std::", "std::allocator", "std::basic_string", "~_Guard", "basic_string"]):
         return True
+    # Regex-based detection for auto-generated labels
+    for pattern in BOILERPLATE_REGEX:
+        if pattern.match(fname):
+            return True
     return False
 
 # --- Heuristic Feature Scoring (Continuous, 0.0 – 1.0) ---
+
+# CWE mapping for known dangerous API calls
+CWE_MAPPING = {
+    "gets":    "CWE-242",  # Use of Inherently Dangerous Function
+    "strcpy":  "CWE-121",  # Stack-based Buffer Overflow
+    "strcat":  "CWE-121",  # Stack-based Buffer Overflow
+    "sprintf": "CWE-134",  # Format String
+    "system":  "CWE-78",   # OS Command Injection
+    "scanf":   "CWE-120",  # Buffer Copy without Checking Size
+}
 
 # Weighted risk scores for known dangerous API calls
 UNSAFE_API_WEIGHTS = {
@@ -142,14 +184,15 @@ def compute_heuristic_score(nodes) -> tuple[float, dict]:
             # Check if this is a safe alternative first (e.g. strncpy before strcpy)
             is_safe_alt = any(sa in instr_lower for sa in SAFE_ALTERNATIVES)
 
-            # Check for unsafe API calls
+            # Check for unsafe API calls using word-boundary matching
+            # This prevents "gets" from matching "fgets" or "strcpy" from matching "strncpy"
             if not is_safe_alt:
                 for api, weight in UNSAFE_API_WEIGHTS.items():
-                    if api in instr_lower:
+                    if re.search(r'(?:^|(?<=[^a-zA-Z0-9]))' + re.escape(api) + r'(?=[^a-zA-Z0-9]|$)', instr_lower):
                         unsafe_hits.append((api, weight))
 
-            # Check for safe API indicators
-            if any(si in instr_lower for si in SAFE_API_INDICATORS):
+            # Check for safe API indicators (word-boundary matching too)
+            if any(re.search(r'(?:^|(?<=[^a-zA-Z0-9]))' + re.escape(si) + r'(?=[^a-zA-Z0-9]|$)', instr_lower) for si in SAFE_API_INDICATORS):
                 safe_hit_count += 1
 
     # Compute the score
@@ -187,31 +230,45 @@ def compute_heuristic_score(nodes) -> tuple[float, dict]:
 
 
 def ensemble_gnn_heuristic(gnn_vuln_prob: float, heuristic_score: float,
-                           gnn_weight_base: float = 0.65) -> float:
+                           heuristic_details: dict | None = None) -> float:
     """
-    Combines GNN probability and heuristic score using confidence-weighted ensembling.
+    Combines GNN probability and heuristic score using context-aware ensembling.
 
-    When the GNN is confident (far from 0.5), it dominates the final score.
-    When the GNN is uncertain (near 0.5), the heuristic has more influence.
+    Strategy:
+      - When the heuristic has NO signal (neutral, no API calls found), we require
+        much stronger GNN evidence to flag. The ensemble biases toward safe because
+        there is no observable evidence of dangerous API usage.
+      - When the heuristic has signal (unsafe or safe API calls detected), normal
+        confidence-weighted blending applies:
+          * GNN confident → GNN dominates
+          * GNN uncertain → heuristic has more influence
 
     Args:
         gnn_vuln_prob:   GNN's raw softmax probability for the 'vulnerable' class (0–1).
         heuristic_score: Heuristic vulnerability score (0–1).
-        gnn_weight_base: Base weight for the GNN (default 0.65 = GNN is always primary).
+        heuristic_details: Dict from compute_heuristic_score, used to detect neutral verdict.
 
     Returns:
         Final blended vulnerability probability (0–1).
     """
-    # GNN confidence: 0.0 when GNN is at 0.5 (uncertain), 1.0 when at 0.0 or 1.0
-    gnn_confidence = abs(gnn_vuln_prob - 0.5) * 2.0
+    is_neutral = heuristic_details and heuristic_details.get("verdict") == "neutral"
 
-    # Scale GNN weight: from gnn_weight_base (when uncertain) up to ~0.90 (when confident)
-    gnn_weight = gnn_weight_base + (1.0 - gnn_weight_base) * gnn_confidence * 0.7
-    heuristic_weight = 1.0 - gnn_weight
+    if is_neutral:
+        # No API evidence at all — bias toward safe
+        # GNN gets equal weight, then final is pulled 15% toward safe
+        gnn_confidence = abs(gnn_vuln_prob - 0.5) * 2.0
+        gnn_weight = 0.5 + 0.2 * gnn_confidence  # ranges 0.5–0.7
+        heuristic_weight = 1.0 - gnn_weight
+        final_prob = gnn_weight * gnn_vuln_prob + heuristic_weight * heuristic_score
+        neutral_pull = 0.15 * (2.0 * final_prob - 1.0)  # negative when >0.5, positive when <0.5
+        final_prob = final_prob - neutral_pull
+    else:
+        # Heuristic has signal — standard confidence-weighted ensemble
+        gnn_confidence = abs(gnn_vuln_prob - 0.5) * 2.0
+        gnn_weight = 0.65 + (1.0 - 0.65) * gnn_confidence * 0.7  # 0.65 → ~0.90
+        heuristic_weight = 1.0 - gnn_weight
+        final_prob = gnn_weight * gnn_vuln_prob + heuristic_weight * heuristic_score
 
-    final_prob = gnn_weight * gnn_vuln_prob + heuristic_weight * heuristic_score
-
-    # Clamp to [0.01, 0.99] to avoid absolute certainty claims
     return max(0.01, min(0.99, final_prob))
 
 
@@ -221,6 +278,7 @@ class VulnerabilityPredictor:
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._gnn_model = None
         self._w2v_model = None
         self._is_loaded = False
@@ -231,26 +289,27 @@ class VulnerabilityPredictor:
         self.gnn_path = Path(__file__).resolve().parent.parent / "artifacts" / "best_fold4.pt"
 
     def load_models(self):
-        """Load Word2Vec and trained GNN weights."""
-        if self._is_loaded:
-            return
+        """Load Word2Vec and trained GNN weights (thread-safe)."""
+        with self._lock:
+            if self._is_loaded:
+                return
 
-        if not self.w2v_path.exists():
-            raise FileNotFoundError(f"Word2Vec model not found at: {self.w2v_path}")
-        if not self.gnn_path.exists():
-            raise FileNotFoundError(f"GNN model weights not found at: {self.gnn_path}")
+            if not self.w2v_path.exists():
+                raise FileNotFoundError(f"Word2Vec model not found at: {self.w2v_path}")
+            if not self.gnn_path.exists():
+                raise FileNotFoundError(f"GNN model weights not found at: {self.gnn_path}")
 
-        logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
-        self._w2v_model = Word2Vec.load(str(self.w2v_path))
+            logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
+            self._w2v_model = Word2Vec.load(str(self.w2v_path))
 
-        logger.info(f"Loading PyTorch GNN model onto {self.device}...")
-        self._gnn_model = VulnGNN(input_dim=128, hidden_dim=64)
-        self._gnn_model.load_state_dict(torch.load(str(self.gnn_path), map_location=self.device, weights_only=True))
-        self._gnn_model.to(self.device)
-        self._gnn_model.eval()
+            logger.info(f"Loading PyTorch GNN model onto {self.device}...")
+            self._gnn_model = VulnGNN(input_dim=128, hidden_dim=64)
+            self._gnn_model.load_state_dict(torch.load(str(self.gnn_path), map_location=self.device, weights_only=True))
+            self._gnn_model.to(self.device)
+            self._gnn_model.eval()
 
-        self._is_loaded = True
-        logger.info("✅ GNN & Word2Vec models loaded successfully.")
+            self._is_loaded = True
+            logger.info("✅ GNN & Word2Vec models loaded successfully.")
 
     @property
     def is_loaded(self) -> bool:
@@ -277,146 +336,197 @@ class VulnerabilityPredictor:
             functions_list = json.load(f)
 
         if not functions_list:
+            logger.warning("No function CFGs extracted from binary. Ghidra may have failed to disassemble.")
             return {
                 "prediction": "Safe",
                 "label": 0,
-                "confidence": 1.0,
+                "confidence": 0.0,
                 "top_features": [],
-                "flagged_functions": []
+                "flagged_functions": [],
+                "_warning": "No CFGs were extracted from this binary. Ghidra may not support this file format or the binary may be stripped beyond analysis."
             }
 
-        analyzed_functions = []
-        flagged_functions = []
-        overall_vulnerable = False
-        max_vuln_confidence = 0.0
-        max_safe_confidence = 0.0
+        with self._lock:
+            analyzed_functions = []
+            flagged_functions = []
+            overall_vulnerable = False
+            has_heuristic_vuln_evidence = False
+            max_vuln_confidence = 0.0
+            max_safe_confidence = 0.0
 
-        w2v = self._w2v_model
-        vector_size = w2v.vector_size
+            w2v = self._w2v_model
+            vector_size = w2v.vector_size
 
-        for func in functions_list:
-            fname = func["function_name"]
-            nodes = func["nodes"]
-            edges = func["edges"]
+            for func in functions_list:
+                fname = func["function_name"]
+                nodes = func["nodes"]
+                edges = func["edges"]
 
-            # Build node features
-            x_list = []
-            for node in nodes:
-                node_vecs = []
-                for instr in node["instructions"]:
-                    # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
-                    instr_clean = instr.split("//")[0]
-                    parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
-                    valid_parts = [p for p in parts if p in w2v.wv]
-                    if valid_parts:
-                        vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
-                        node_vecs.append(vec)
+                # Build node features
+                x_list = []
+                total_tokens = 0
+                oov_tokens = 0
+                for node in nodes:
+                    node_vecs = []
+                    for instr in node["instructions"]:
+                        # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
+                        instr_clean = instr.split("//")[0]
+                        parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
+                        total_tokens += len(parts)
+                        valid_parts = [p for p in parts if p in w2v.wv]
+                        oov_tokens += len(parts) - len(valid_parts)
+                        if valid_parts:
+                            vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
+                            node_vecs.append(vec)
 
-                if node_vecs:
-                    node_feat = np.mean(node_vecs, axis=0)
+                    if node_vecs:
+                        node_feat = np.mean(node_vecs, axis=0)
+                    else:
+                        node_feat = np.zeros(vector_size)
+                    x_list.append(node_feat)
+
+                    oov_rate = oov_tokens / total_tokens if total_tokens > 0 else 0.0
+                if oov_rate > 0.5:
+                    logger.warning(f"  High OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%}) — node vector may be zero or noise-dominated")
+                elif oov_rate > 0.3:
+                    logger.info(f"  Moderate OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%})")
+
+                x = torch.tensor(np.array(x_list), dtype=torch.float).to(self.device)
+
+                # Build edge index
+                if len(edges) > 0:
+                    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(self.device)
                 else:
-                    node_feat = np.zeros(vector_size)
-                x_list.append(node_feat)
+                    edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
 
-            x = torch.tensor(np.array(x_list), dtype=torch.float).to(self.device)
+                # Check if symbol is compiler boilerplate
+                if is_boilerplate_or_lib(fname):
+                    vuln_prob = 0.0
+                    safe_prob = 1.0
+                    is_vuln = False
+                    confidence = 1.0
+                    heuristic_details = None
+                else:
+                    # Run GNN model
+                    batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
+                    with torch.no_grad():
+                        out = self._gnn_model(x, edge_index, batch)
+                        probs = torch.softmax(out, dim=1)[0]
+                        vuln_prob = float(probs[1])
+                        safe_prob = float(probs[0])
 
-            # Build edge index
-            if len(edges) > 0:
-                edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(self.device)
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
+                    # --- Confidence-Weighted Ensemble ---
+                    # Step 1: Get raw GNN prediction
+                    raw_gnn_vuln = vuln_prob
 
-            # Check if symbol is compiler boilerplate
-            if is_boilerplate_or_lib(fname):
-                vuln_prob = 0.0
-                safe_prob = 1.0
-                is_vuln = False
-                confidence = 1.0
-            else:
-                # Run GNN model
-                batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
-                with torch.no_grad():
-                    out = self._gnn_model(x, edge_index, batch)
-                    probs = torch.softmax(out, dim=1)[0]
-                    vuln_prob = float(probs[1])
-                    safe_prob = float(probs[0])
+                    # Step 2: Get continuous heuristic score
+                    heuristic_score, heuristic_details = compute_heuristic_score(nodes)
 
-                # --- Confidence-Weighted Ensemble ---
-                # Step 1: Get raw GNN prediction
-                raw_gnn_vuln = vuln_prob
+                    # Step 3: Blend via context-aware ensemble (conservative when heuristic has no signal)
+                    vuln_prob = ensemble_gnn_heuristic(raw_gnn_vuln, heuristic_score, heuristic_details)
+                    safe_prob = 1.0 - vuln_prob
+                    is_vuln = vuln_prob > 0.5
+                    confidence = vuln_prob if is_vuln else safe_prob
 
-                # Step 2: Get continuous heuristic score
-                heuristic_score, heuristic_details = compute_heuristic_score(nodes)
-
-                # Step 3: Blend via confidence-weighted ensemble
-                vuln_prob = ensemble_gnn_heuristic(raw_gnn_vuln, heuristic_score)
-                safe_prob = 1.0 - vuln_prob
-                is_vuln = vuln_prob > 0.5
-                confidence = vuln_prob if is_vuln else safe_prob
-
-                # Log disagreements for analysis
-                gnn_verdict = "Vulnerable" if raw_gnn_vuln > 0.5 else "Safe"
-                final_verdict = "Vulnerable" if is_vuln else "Safe"
-                if gnn_verdict != final_verdict:
+                    # Log all ensemble decisions (not just disagreements)
+                    gnn_verdict = "Vulnerable" if raw_gnn_vuln > 0.5 else "Safe"
+                    final_verdict = "Vulnerable" if is_vuln else "Safe"
+                    gnn_confidence_score = abs(raw_gnn_vuln - 0.5) * 2.0
+                    gnn_weight_used = 0.65 + (1.0 - 0.65) * gnn_confidence_score * 0.7
+                    heuristic_weight_used = 1.0 - gnn_weight_used
                     logger.info(
-                        f"  ⚖ Ensemble adjusted {fname}: GNN={raw_gnn_vuln:.3f} "
+                        f"  ENSEMBLE {fname}: GNN={raw_gnn_vuln:.3f} "
                         f"Heuristic={heuristic_score:.3f} → Final={vuln_prob:.3f} "
-                        f"({gnn_verdict}→{final_verdict}) | {heuristic_details}"
+                        f"(gnn_w={gnn_weight_used:.2f}, heur_w={heuristic_weight_used:.2f}) "
+                        f"| {heuristic_details}"
                     )
 
-            # Formulate decompiled / disassembled preview for RAG context
-            decompiled_lines = []
-            for idx, node in enumerate(nodes):
-                decompiled_lines.append(f"Basic Block {idx}:")
-                for instr in node["instructions"]:
-                    decompiled_lines.append(f"  {instr}")
+                # Formulate decompiled / disassembled preview for RAG context
+                decompiled_lines = []
+                for idx, node in enumerate(nodes):
+                    decompiled_lines.append(f"Basic Block {idx}:")
+                    for instr in node["instructions"]:
+                        decompiled_lines.append(f"  {instr}")
 
-            func_info = {
-                "function_name": fname,
-                "confidence": round(confidence, 4),
-                "is_vulnerable": is_vuln,
-                "nodes_count": len(nodes),
-                "edges_count": len(edges)
-            }
-            analyzed_functions.append(func_info)
-
-            if is_vuln:
-                overall_vulnerable = True
-                if vuln_prob > max_vuln_confidence:
-                    max_vuln_confidence = vuln_prob
-
-                flagged_functions.append({
+                func_info = {
                     "function_name": fname,
-                    "confidence": round(vuln_prob, 4),
-                    "decompiled_code": "\n".join(decompiled_lines),
-                    "cwe_id": "CWE-119",  # Fallback memory corruption
-                    "brief_explanation": f"GNN model GATv2 classified this function as highly suspicious of memory safety vulnerabilities (e.g. CWE-119, CWE-120 buffer overflows) with {vuln_prob:.1%} confidence."
-                })
+                    "confidence": round(confidence, 4),
+                    "is_vulnerable": is_vuln,
+                    "nodes_count": len(nodes),
+                    "edges_count": len(edges),
+                    "oov_rate": round(oov_rate, 4)
+                }
+                analyzed_functions.append(func_info)
+
+                if is_vuln:
+                    overall_vulnerable = True
+                    # Track whether heuristic found actual vulnerability evidence (unsafe API calls)
+                    heuristic_verdict = heuristic_details.get("verdict") if heuristic_details else None
+                    if heuristic_verdict == "vulnerable":
+                        has_heuristic_vuln_evidence = True
+                    if vuln_prob > max_vuln_confidence:
+                        max_vuln_confidence = vuln_prob
+
+                    # Detect all unsafe API(s) present to assign best CWE(s)
+                    detected_cwes = set()
+                    detected_apis = []
+                    for node in nodes:
+                        for instr in node["instructions"]:
+                            instr_lower = instr.lower()
+                            for api, cwe in CWE_MAPPING.items():
+                                if re.search(r'(?:^|(?<=[^a-zA-Z0-9]))' + re.escape(api) + r'(?=[^a-zA-Z0-9]|$)', instr_lower):
+                                    detected_apis.append(api)
+                                    detected_cwes.add(cwe)
+                    detected_cwe = ", ".join(sorted(detected_cwes)) if detected_cwes else "CWE-119"
+                    brief = (
+                        f"Ensemble (GNN+heuristic) flagged this function at {vuln_prob:.1%} confidence. "
+                        f"Detected API calls: {', '.join(set(detected_apis)) or 'suspicious CFG patterns'}. "
+                        f"Associated weakness: {detected_cwe}."
+                    )
+
+                    flagged_functions.append({
+                        "function_name": fname,
+                        "confidence": round(vuln_prob, 4),
+                        "decompiled_code": "\n".join(decompiled_lines),
+                        "cwe_id": detected_cwe,
+                        "brief_explanation": brief
+                    })
+                else:
+                    if safe_prob > max_safe_confidence:
+                        max_safe_confidence = safe_prob
+
+            # Override: overall verdict requires heuristic vulnerability evidence (unsafe API calls)
+            # This prevents CRT/startup routines (GNN-only false positives) from triggering Vulnerable
+            verdict_overridden = overall_vulnerable and not has_heuristic_vuln_evidence
+            overall_vulnerable = has_heuristic_vuln_evidence
+
+            overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
+            overall_label = 1 if overall_vulnerable else 0
+            if overall_vulnerable:
+                overall_confidence = max_vuln_confidence
+            elif verdict_overridden:
+                # Override: report inverse of top GNN flag as safe confidence
+                overall_confidence = 1.0 - max_vuln_confidence
             else:
-                if safe_prob > max_safe_confidence:
-                    max_safe_confidence = safe_prob
+                overall_confidence = max_safe_confidence
 
-        overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
-        overall_label = 1 if overall_vulnerable else 0
-        overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
+            # Format top_features to display analyzed functions in the frontend dashboard
+            top_features = []
+            for af in sorted(analyzed_functions, key=lambda x: x["confidence"], reverse=True):
+                status = "Vulnerable" if af["is_vulnerable"] else "Safe"
+                top_features.append({
+                    "feature": f"{af['function_name']} ({status})",
+                    "importance": af["confidence"],
+                    "tfidf_weight": af["nodes_count"]
+                })
 
-        # Format top_features to display analyzed functions in the frontend dashboard
-        top_features = []
-        for af in sorted(analyzed_functions, key=lambda x: x["confidence"], reverse=True):
-            status = "Vulnerable" if af["is_vulnerable"] else "Safe"
-            top_features.append({
-                "feature": f"{af['function_name']} ({status})",
-                "importance": af["confidence"],
-                "tfidf_weight": af["nodes_count"]
-            })
-
-        return {
-            "prediction": overall_prediction,
-            "label": overall_label,
-            "confidence": round(overall_confidence, 4),
-            "top_features": top_features,
-            "flagged_functions": flagged_functions
-        }
+            return {
+                "prediction": overall_prediction,
+                "label": overall_label,
+                "confidence": round(overall_confidence, 4),
+                "top_features": top_features,
+                "flagged_functions": flagged_functions
+            }
 
 
 # Module singleton

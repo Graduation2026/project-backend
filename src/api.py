@@ -1,12 +1,22 @@
 """
-api.py - The Controller API for the Vulnerability Detection System.
+api.py — FastAPI Controller for the Hybrid GNN Vulnerability Detection System.
 
-This is the brain of the operation. A single FastAPI application that:
-  1. Serves a professional web dashboard at /
-  2. Accepts an uploaded binary file via /analyze
-  3. Runs Ghidra headless analysis to extract features
-  4. Feeds features into the trained ML model
-  5. Returns a JSON verdict: Safe or Vulnerable
+Pipeline:
+  1. Serves web dashboard, guide, and library pages
+  2. Accepts uploaded binary (.exe, .o, .elf) or C/C++ source files via /analyze
+  3. Auto-compiles source files to object code using isolated temp directories
+  4. Runs Ghidra headless disassembly to extract Control Flow Graphs (CFGs)
+  5. Runs hybrid GNN (GATv2) + heuristic ensemble vulnerability prediction
+  6. Generates context-enriched security report via RAG (Gemini + ChromaDB)
+  7. Renders report to PDF and returns full JSON payload
+
+Security features:
+  - Rate limiting (per-IP, configurable via RateLimiter)
+  - Optional API key authentication (SENTINEL_API_KEY env var)
+  - File content validation (magic bytes, null-byte rejection)
+  - Isolated temp directories with cleanup for compilation
+  - CORS restricted to explicitly configured origins
+  - Security headers (CSP, HSTS, XSS protection, etc.)
 
 Run:
     python -m uvicorn src.api:app --reload --host 0.0.0.0 --port 8000
@@ -15,15 +25,18 @@ Run:
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import uuid
 import time
+import threading
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +57,73 @@ from .predictor import predictor
 from .rag_service import rag_service
 from .utils.pdf_generator import convert_markdown_to_pdf
 
+# --- Simple In-Memory Rate Limiter (per-IP token bucket) ---
+class RateLimiter:
+    def __init__(self, max_requests: int = 10, window_seconds: int = 60):
+        self._lock = threading.Lock()
+        self.max_requests = max_requests
+        self.window = timedelta(seconds=window_seconds)
+        self._buckets: dict[str, list[datetime]] = defaultdict(list)
+
+    def check(self, client_ip: str) -> bool:
+        now = datetime.now(timezone.utc)
+        cutoff = now - self.window
+        with self._lock:
+            self._buckets[client_ip] = [t for t in self._buckets[client_ip] if t > cutoff]
+            if len(self._buckets[client_ip]) >= self.max_requests:
+                return False
+            self._buckets[client_ip].append(now)
+            return True
+
+rate_limiter = RateLimiter(max_requests=20, window_seconds=60)  # 20 req/min per IP
+
+
+# --- Optional API Key Authentication ---
+API_KEY = os.getenv("SENTINEL_API_KEY", "")
+def verify_api_key(request: Request):
+    if not API_KEY:
+        return True  # Auth disabled if no key is configured
+    provided = request.headers.get("X-API-Key", "")
+    if provided == API_KEY:
+        return True
+    raise HTTPException(status_code=401, detail="Invalid or missing API key. Provide X-API-Key header.")
+
+
+# --- File Content Validation ---
+MAGIC_BYTES = {
+    b"\x4d\x5a": "Windows PE (exe/dll)",
+    b"\x7f\x45\x4c\x46": "ELF (Linux binary)",
+}
+def validate_file_content(content: bytes, filename: str) -> None:
+    """Basic content validation: reject non-binary files uploaded as binary, check magic bytes."""
+    ext = Path(filename).suffix.lower()
+    binary_exts = {".exe", ".o", ".elf", ".dll", ".so", ".bin"}
+    if ext in binary_exts and len(content) >= 4:
+        # Check if it's actually a binary (not text masquerading as binary)
+        if content[:2] not in [b"\x4d\x5a", b"\x7f\x45"] and ext in {".exe", ".elf", ".dll"}:
+            logger.warning(f"File {filename} has extension {ext} but invalid magic bytes: {content[:4].hex()}")
+    # Reject files containing null bytes if they claim to be text
+    text_exts = {".c", ".cpp", ".cc", ".h", ".hpp", ".cxx"}
+    if ext in text_exts and b"\x00" in content[:1024]:
+        raise HTTPException(status_code=400, detail=f"Source file {filename} contains null bytes — not valid text.")
+
+
+# --- Security Headers Middleware Helper ---
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
 # --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -56,9 +136,14 @@ logger = logging.getLogger("api")
 def compile_source(source_path: Path, output_o_path: Path) -> Path:
     """
     Compiles a C/C++ source file into a relocatable object file (.o)
-    using MinGW GCC/G++, supporting standalone functions without main().
-    Handles .h/.hpp files by converting inline/static definitions into standard
-    global symbols so the compiler emits code bodies.
+    using MinGW GCC/G++ in an isolated temp directory with resource limits.
+
+    Security measures:
+    - Compilation runs in an isolated temp directory (tempfile.mkdtemp)
+    - 120-second timeout prevents runaway compilation
+    - Temp directories are cleaned up in finally block
+    - Header files (.h/.hpp) have static/inline removed to force symbol emission
+    - Output is copied out of the isolated directory, then the directory is destroyed
     """
     file_ext = source_path.suffix.lower()
     is_header = file_ext in [".h", ".hpp"]
@@ -82,16 +167,29 @@ def compile_source(source_path: Path, output_o_path: Path) -> Path:
 
     try:
         compiler = "g++" if temp_source_path.suffix.lower() == ".cpp" else "gcc"
-        # Compile: gcc/g++ -O0 -g -c -o output_o_path temp_source_path
-        command = [compiler, "-O0", "-g", "-c", "-o", str(output_o_path), str(temp_source_path)]
-        result = subprocess.run(command, capture_output=True, text=True)
-        
+        # Compile in isolated temp directory with timeout and resource limits
+        import tempfile
+        compile_dir = Path(tempfile.mkdtemp(prefix="sentinel_compile_"))
+        isolated_o_path = compile_dir / output_o_path.name
+        command = [compiler, "-O0", "-g", "-c", "-o", str(isolated_o_path), str(temp_source_path)]
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            timeout=120  # 2-minute compile timeout
+        )
         if result.returncode != 0:
             raise Exception(f"MinGW compilation failed:\n{result.stderr}")
+        shutil.copy2(isolated_o_path, output_o_path)
+    except subprocess.TimeoutExpired:
+        raise Exception("MinGW compilation timed out after 120s")
     finally:
-        # Always clean up temp source file if it was created
+        # Clean up temp source file if created
         if is_header and temp_source_path.exists():
             temp_source_path.unlink()
+        # Clean up isolated compile directory
+        try:
+            shutil.rmtree(str(compile_dir), ignore_errors=True)
+        except Exception:
+            pass
             
     return output_o_path
 
@@ -123,14 +221,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS — restrict origins in production (must be explicitly configured)
+ALLOWED_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()] if ALLOWED_ORIGINS_RAW else []
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else [],
+    allow_credentials=bool(ALLOWED_ORIGINS),
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+
+# Security headers + rate limiting middleware
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Rate limiting (skip for health/model-info endpoints)
+    if request.url.path not in ("/health", "/model-info") and request.method != "GET":
+        client_ip = request.client.host if request.client else "unknown"
+        if not rate_limiter.check(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"error": "Too many requests", "message": "Rate limit exceeded. Try again later."}
+            )
+    response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers[header] = value
+    return response
 
 # Static reports folder configuration
 reports_static_dir = PROJECT_ROOT / "src" / "static" / "reports"
@@ -197,7 +314,8 @@ async def model_info():
         return {
             "accuracy": 0,
             "total_samples": 0,
-            "n_estimators": 0,
+            "gnn_layers": 0,
+            "model_type": "N/A",
             "trained_at": "Not trained yet",
         }
     with open(meta_path, "r") as f:
@@ -206,7 +324,7 @@ async def model_info():
 
 # --- POST /analyze ---
 @app.post("/analyze", tags=["Analysis"])
-async def analyze_binary(file: UploadFile = File(...)):
+async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(verify_api_key)):
     """
     Upload a binary file or C/C++ source code for vulnerability analysis.
 
@@ -214,10 +332,12 @@ async def analyze_binary(file: UploadFile = File(...)):
     1. Validate the file type (.c and .cpp files are auto-compiled on the fly)
     2. Run Ghidra headless reverse engineering
     3. Extract assembly features (opcodes)
-    4. Run the trained Random Forest model
+    4. Run the hybrid GNN + heuristic ensemble model
     5. Return a prediction with confidence score
 
     **Accepted formats:** .exe, .o, .elf, .dll, .so, .bin, .c, .cpp, .cc, .h, .hpp
+
+    **Authentication:** Set SENTINEL_API_KEY env var and pass X-API-Key header.
     """
     total_start = time.time()
 
@@ -247,6 +367,12 @@ async def analyze_binary(file: UploadFile = File(...)):
             },
         )
 
+    # Quick content-type sanity check for binary uploads
+    binary_extensions = {".exe", ".o", ".elf", ".dll", ".so", ".bin"}
+    if file_ext in binary_extensions and file.content_type:
+        if "octet-stream" not in file.content_type and "x-msdownload" not in file.content_type:
+            logger.warning(f"Unexpected Content-Type for binary: {file.content_type}")
+
     # Save uploaded file
     import re
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -269,6 +395,9 @@ async def analyze_binary(file: UploadFile = File(...)):
                     "max_mb": MAX_FILE_SIZE_MB,
                 },
             )
+
+        # Validate file content before writing to disk
+        validate_file_content(content, file.filename)
 
         sha256_hash = hashlib.sha256(content).hexdigest()
 
@@ -339,9 +468,9 @@ async def analyze_binary(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GNN prediction failed: {str(e)}")
 
-    # Generate RAG Vulnerability Report and Render PDF
+    # Generate context-enriched Vulnerability Report and Render PDF
     try:
-        logger.info("Generating RAG security report...")
+        logger.info("Generating context-enriched security report...")
         report_markdown = rag_service.generate_vulnerability_report(
             flagged_functions=result["flagged_functions"],
             filename=file.filename,
@@ -356,11 +485,11 @@ async def analyze_binary(file: UploadFile = File(...)):
         convert_markdown_to_pdf(report_markdown, pdf_path)
         pdf_url = f"/reports/{pdf_filename}"
     except Exception as e:
-        logger.error(f"RAG or PDF generation failed: {str(e)}")
-        report_markdown = f"# Analysis Completed\n\nFailed to generate interactive RAG report: {str(e)}"
+        logger.error(f"Report or PDF generation failed: {str(e)}")
+        report_markdown = f"# Analysis Completed\n\nFailed to generate security report: {str(e)}"
         pdf_url = ""
 
-    # Build response payload combining Sentinel dashboard compatibility + Ultimate RAG blueprint
+    # Build response payload combining Sentinel dashboard compatibility + AI report data
     total_time = time.time() - total_start
     verdict = "SAFE" if result["label"] == 0 else "VULNERABLE"
     risk_score = float(result["confidence"] * 100 if verdict == "VULNERABLE" else (1 - result["confidence"]) * 100)
