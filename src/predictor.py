@@ -8,6 +8,7 @@ then disassembles instructions to node embeddings and runs GATv2 model inference
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 import numpy as np
 import torch
@@ -214,6 +215,7 @@ class VulnerabilityPredictor:
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._gnn_models = {}  # Dictionary to hold all active fold models
         self._w2v_model = None
         self._is_loaded = False
@@ -225,46 +227,47 @@ class VulnerabilityPredictor:
 
     def load_models(self):
         """Load Word2Vec and trained GNN weights (with ensemble folds if available)."""
-        if self._is_loaded:
-            return
+        with self._lock:
+            if self._is_loaded:
+                return
 
-        if not self.w2v_path.exists():
-            raise FileNotFoundError(f"Word2Vec model not found at: {self.w2v_path}")
-        if not self.gnn_path.exists():
-            raise FileNotFoundError(f"GNN model weights not found at: {self.gnn_path}")
+            if not self.w2v_path.exists():
+                raise FileNotFoundError(f"Word2Vec model not found at: {self.w2v_path}")
+            if not self.gnn_path.exists():
+                raise FileNotFoundError(f"GNN model weights not found at: {self.gnn_path}")
 
-        logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
-        self._w2v_model = Word2Vec.load(str(self.w2v_path))
+            logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
+            self._w2v_model = Word2Vec.load(str(self.w2v_path))
 
-        # Determine folds to load with graceful fallback
-        model_paths = {
-            "fold4": self.gnn_path  # Fold 4 is always required
-        }
-        fold0_path = self.gnn_path.parent / "best_fold0.pt"
-        fold1_path = self.gnn_path.parent / "best_fold1.pt"
-        
-        if fold0_path.exists():
-            model_paths["fold0"] = fold0_path
-        if fold1_path.exists():
-            model_paths["fold1"] = fold1_path
+            # Determine folds to load with graceful fallback
+            model_paths = {
+                "fold4": self.gnn_path  # Fold 4 is always required
+            }
+            fold0_path = self.gnn_path.parent / "best_fold0.pt"
+            fold1_path = self.gnn_path.parent / "best_fold1.pt"
+            
+            if fold0_path.exists():
+                model_paths["fold0"] = fold0_path
+            if fold1_path.exists():
+                model_paths["fold1"] = fold1_path
 
-        logger.info(f"Initializing GNN models from loaded paths: {list(model_paths.keys())}...")
-        
-        for fold_name, path in model_paths.items():
-            try:
-                model = VulnGNN(input_dim=128, hidden_dim=64)
-                model.load_state_dict(torch.load(str(path), map_location=self.device, weights_only=True))
-                model.to(self.device)
-                model.eval()
-                self._gnn_models[fold_name] = model
-                logger.info(f"✅ Loaded GNN {fold_name} weights successfully.")
-            except Exception as e:
-                logger.error(f"❌ Failed to load GNN {fold_name} weights from {path}: {e}")
-                if fold_name == "fold4":
-                    raise e  # Fail hard if the primary fold fails
+            logger.info(f"Initializing GNN models from loaded paths: {list(model_paths.keys())}...")
+            
+            for fold_name, path in model_paths.items():
+                try:
+                    model = VulnGNN(input_dim=128, hidden_dim=64)
+                    model.load_state_dict(torch.load(str(path), map_location=self.device, weights_only=True))
+                    model.to(self.device)
+                    model.eval()
+                    self._gnn_models[fold_name] = model
+                    logger.info(f"✅ Loaded GNN {fold_name} weights successfully.")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load GNN {fold_name} weights from {path}: {e}")
+                    if fold_name == "fold4":
+                        raise e  # Fail hard if the primary fold fails
 
-        self._is_loaded = True
-        logger.info(f"✅ GNN & Word2Vec models loaded successfully. Active folds: {list(self._gnn_models.keys())}")
+            self._is_loaded = True
+            logger.info(f"✅ GNN & Word2Vec models loaded successfully. Active folds: {list(self._gnn_models.keys())}")
 
     @property
     def is_loaded(self) -> bool:
@@ -280,18 +283,19 @@ class VulnerabilityPredictor:
         Returns:
             dict with verdict, confidence, top_features (list of analyzed functions), and flagged_functions list.
         """
-        if not self._is_loaded:
-            self.load_models()
+        with self._lock:
+            if not self._is_loaded:
+                self.load_models()
 
-        json_path = Path(json_filepath)
-        if not json_path.exists():
-            raise FileNotFoundError(f"Features JSON file not found at: {json_path}")
+            json_path = Path(json_filepath)
+            if not json_path.exists():
+                raise FileNotFoundError(f"Features JSON file not found at: {json_path}")
 
-        with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
-            functions_list = json.load(f)
+            with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
+                functions_list = json.load(f)
 
-        if not functions_list:
-            return {
+            if not functions_list:
+                return {
                 "prediction": "Safe",
                 "label": 0,
                 "confidence": 1.0,
@@ -300,169 +304,169 @@ class VulnerabilityPredictor:
                 "decision_source": "gnn"
             }
 
-        analyzed_functions = []
-        flagged_functions = []
-        overall_vulnerable = False
-        max_vuln_confidence = 0.0
-        max_safe_confidence = 0.0
+            analyzed_functions = []
+            flagged_functions = []
+            overall_vulnerable = False
+            max_vuln_confidence = 0.0
+            max_safe_confidence = 0.0
 
-        w2v = self._w2v_model
-        vector_size = w2v.vector_size
+            w2v = self._w2v_model
+            vector_size = w2v.vector_size
 
-        for func in functions_list:
-            fname = func["function_name"]
-            nodes = func["nodes"]
-            edges = func["edges"]
+            for func in functions_list:
+                fname = func["function_name"]
+                nodes = func["nodes"]
+                edges = func["edges"]
 
-            # Build node features
-            x_list = []
-            total_tokens = 0
-            oov_tokens = 0
-            for node in nodes:
-                node_vecs = []
-                for instr in node["instructions"]:
-                    # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
-                    instr_clean = instr.split("//")[0]
-                    parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
-                    total_tokens += len(parts)
-                    valid_parts = [p for p in parts if p in w2v.wv]
-                    oov_tokens += len(parts) - len(valid_parts)
-                    if valid_parts:
-                        vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
-                        node_vecs.append(vec)
+                # Build node features
+                x_list = []
+                total_tokens = 0
+                oov_tokens = 0
+                for node in nodes:
+                    node_vecs = []
+                    for instr in node["instructions"]:
+                        # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
+                        instr_clean = instr.split("//")[0]
+                        parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
+                        total_tokens += len(parts)
+                        valid_parts = [p for p in parts if p in w2v.wv]
+                        oov_tokens += len(parts) - len(valid_parts)
+                        if valid_parts:
+                            vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
+                            node_vecs.append(vec)
 
-                if node_vecs:
-                    node_feat = np.mean(node_vecs, axis=0)
+                    if node_vecs:
+                        node_feat = np.mean(node_vecs, axis=0)
+                    else:
+                        node_feat = np.zeros(vector_size)
+                    x_list.append(node_feat)
+
+                # OOV tracking — warn if Word2Vec doesn't understand the instruction set
+                oov_rate = oov_tokens / total_tokens if total_tokens > 0 else 0.0
+                if oov_rate > 0.5:
+                    logger.warning(f"  High OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%}) — node vectors may be noise-dominated")
+                elif oov_rate > 0.3:
+                    logger.info(f"  Moderate OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%})")
+
+                x = torch.tensor(np.array(x_list), dtype=torch.float).to(self.device)
+
+                # Build edge index
+                if len(edges) > 0:
+                    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(self.device)
                 else:
-                    node_feat = np.zeros(vector_size)
-                x_list.append(node_feat)
+                    edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
 
-            # OOV tracking — warn if Word2Vec doesn't understand the instruction set
-            oov_rate = oov_tokens / total_tokens if total_tokens > 0 else 0.0
-            if oov_rate > 0.5:
-                logger.warning(f"  High OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%}) — node vectors may be noise-dominated")
-            elif oov_rate > 0.3:
-                logger.info(f"  Moderate OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%})")
-
-            x = torch.tensor(np.array(x_list), dtype=torch.float).to(self.device)
-
-            # Build edge index
-            if len(edges) > 0:
-                edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(self.device)
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
-
-            # Check if symbol is compiler boilerplate
-            if is_boilerplate_or_lib(fname):
-                vuln_prob = 0.0
-                safe_prob = 1.0
-                is_vuln = False
-                confidence = 1.0
-                func_decision_source = "gnn"
-            else:
-                # Run ensemble GNN models
-                batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
-                probs_list = []
-                with torch.no_grad():
-                    for fold_name, model in self._gnn_models.items():
-                        out = model(x, edge_index, batch)
-                        probs = torch.softmax(out, dim=1)[0]
-                        probs_list.append(probs)
-                
-                # Average probabilities across loaded folds
-                avg_probs = torch.stack(probs_list).mean(dim=0)
-                gnn_avg_vuln_prob = float(avg_probs[1])
-                gnn_avg_safe_prob = float(avg_probs[0])
-
-                # Compute soft heuristic fusion with GNN uncertainty gating
-                heuristic_delta = compute_heuristic_delta(nodes)
-                
-                # GNN Uncertainty: 1.0 when at 0.5 (perfect uncertainty), 0.0 when at 0.0 or 1.0 (perfect certainty)
-                uncertainty = 1.0 - abs(gnn_avg_vuln_prob - 0.5) * 2.0
-                effective_delta = heuristic_delta * uncertainty
-                
-                # Final blended probability (clamped to [0.01, 0.99] to avoid absolute certainty claims)
-                vuln_prob = max(0.01, min(0.99, gnn_avg_vuln_prob + effective_delta))
-                safe_prob = 1.0 - vuln_prob
-                
-                is_vuln = vuln_prob > 0.5
-                confidence = vuln_prob if is_vuln else safe_prob
-                
-                # Decision source tracking: hybrid if delta shifted/nudge was applied significantly (>0.02)
-                func_decision_source = "hybrid" if abs(vuln_prob - gnn_avg_vuln_prob) > 0.02 else "gnn"
-
-            # Formulate decompiled / disassembled preview for RAG context
-            decompiled_lines = []
-            for idx, node in enumerate(nodes):
-                decompiled_lines.append(f"Basic Block {idx}:")
-                for instr in node["instructions"]:
-                    decompiled_lines.append(f"  {instr}")
-
-            func_info = {
-                "function_name": fname,
-                "confidence": round(confidence, 4),
-                "is_vulnerable": is_vuln,
-                "nodes_count": len(nodes),
-                "edges_count": len(edges),
-                "decision_source": func_decision_source,
-                "oov_rate": round(oov_rate, 4)
-            }
-            analyzed_functions.append(func_info)
-
-            if is_vuln:
-                overall_vulnerable = True
-                if vuln_prob > max_vuln_confidence:
-                    max_vuln_confidence = vuln_prob
-
-                # Dynamic explanation based on active folds
-                num_folds = len(self._gnn_models)
-                if num_folds > 1:
-                    folds_list = sorted([k.replace("fold", "") for k in self._gnn_models.keys()])
-                    active_folds_str = ",".join(folds_list)
-                    explanation = f"Ensemble of {num_folds} GATv2 models (folds {active_folds_str}) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+                # Check if symbol is compiler boilerplate
+                if is_boilerplate_or_lib(fname):
+                    vuln_prob = 0.0
+                    safe_prob = 1.0
+                    is_vuln = False
+                    confidence = 1.0
+                    func_decision_source = "gnn"
                 else:
-                    explanation = f"GATv2 GNN model (fold 4) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+                    # Run ensemble GNN models
+                    batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
+                    probs_list = []
+                    with torch.no_grad():
+                        for fold_name, model in self._gnn_models.items():
+                            out = model(x, edge_index, batch)
+                            probs = torch.softmax(out, dim=1)[0]
+                            probs_list.append(probs)
+                    
+                    # Average probabilities across loaded folds
+                    avg_probs = torch.stack(probs_list).mean(dim=0)
+                    gnn_avg_vuln_prob = float(avg_probs[1])
+                    gnn_avg_safe_prob = float(avg_probs[0])
 
-                flagged_functions.append({
+                    # Compute soft heuristic fusion with GNN uncertainty gating
+                    heuristic_delta = compute_heuristic_delta(nodes)
+                    
+                    # GNN Uncertainty: 1.0 when at 0.5 (perfect uncertainty), 0.0 when at 0.0 or 1.0 (perfect certainty)
+                    uncertainty = 1.0 - abs(gnn_avg_vuln_prob - 0.5) * 2.0
+                    effective_delta = heuristic_delta * uncertainty
+                    
+                    # Final blended probability (clamped to [0.01, 0.99] to avoid absolute certainty claims)
+                    vuln_prob = max(0.01, min(0.99, gnn_avg_vuln_prob + effective_delta))
+                    safe_prob = 1.0 - vuln_prob
+                    
+                    is_vuln = vuln_prob > 0.5
+                    confidence = vuln_prob if is_vuln else safe_prob
+                    
+                    # Decision source tracking: hybrid if delta shifted/nudge was applied significantly (>0.02)
+                    func_decision_source = "hybrid" if abs(vuln_prob - gnn_avg_vuln_prob) > 0.02 else "gnn"
+
+                # Formulate decompiled / disassembled preview for RAG context
+                decompiled_lines = []
+                for idx, node in enumerate(nodes):
+                    decompiled_lines.append(f"Basic Block {idx}:")
+                    for instr in node["instructions"]:
+                        decompiled_lines.append(f"  {instr}")
+
+                func_info = {
                     "function_name": fname,
-                    "confidence": round(vuln_prob, 4),
-                    "decompiled_code": "\n".join(decompiled_lines),
-                    "cwe_id": detect_cwe_from_code(decompiled_lines),
-                    "brief_explanation": explanation,
-                    "decision_source": func_decision_source
+                    "confidence": round(confidence, 4),
+                    "is_vulnerable": is_vuln,
+                    "nodes_count": len(nodes),
+                    "edges_count": len(edges),
+                    "decision_source": func_decision_source,
+                    "oov_rate": round(oov_rate, 4)
+                }
+                analyzed_functions.append(func_info)
+
+                if is_vuln:
+                    overall_vulnerable = True
+                    if vuln_prob > max_vuln_confidence:
+                        max_vuln_confidence = vuln_prob
+
+                    # Dynamic explanation based on active folds
+                    num_folds = len(self._gnn_models)
+                    if num_folds > 1:
+                        folds_list = sorted([k.replace("fold", "") for k in self._gnn_models.keys()])
+                        active_folds_str = ",".join(folds_list)
+                        explanation = f"Ensemble of {num_folds} GATv2 models (folds {active_folds_str}) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+                    else:
+                        explanation = f"GATv2 GNN model (fold 4) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+
+                    flagged_functions.append({
+                        "function_name": fname,
+                        "confidence": round(vuln_prob, 4),
+                        "decompiled_code": "\n".join(decompiled_lines),
+                        "cwe_id": detect_cwe_from_code(decompiled_lines),
+                        "brief_explanation": explanation,
+                        "decision_source": func_decision_source
+                    })
+                else:
+                    if safe_prob > max_safe_confidence:
+                        max_safe_confidence = safe_prob
+
+            overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
+            overall_label = 1 if overall_vulnerable else 0
+            overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
+
+            # Determine overall decision source (hybrid if any flagged function is hybrid)
+            overall_decision_source = "gnn"
+            if flagged_functions:
+                if any(f["decision_source"] == "hybrid" for f in flagged_functions):
+                    overall_decision_source = "hybrid"
+
+            # Format top_features to display analyzed functions in the frontend dashboard
+            top_features = []
+            for af in sorted(analyzed_functions, key=lambda x: x["confidence"], reverse=True):
+                status = "Vulnerable" if af["is_vulnerable"] else "Safe"
+                top_features.append({
+                    "feature": f"{af['function_name']} ({status})",
+                    "importance": af["confidence"],
+                    "tfidf_weight": af["nodes_count"]
                 })
-            else:
-                if safe_prob > max_safe_confidence:
-                    max_safe_confidence = safe_prob
 
-        overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
-        overall_label = 1 if overall_vulnerable else 0
-        overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
-
-        # Determine overall decision source (hybrid if any flagged function is hybrid)
-        overall_decision_source = "gnn"
-        if flagged_functions:
-            if any(f["decision_source"] == "hybrid" for f in flagged_functions):
-                overall_decision_source = "hybrid"
-
-        # Format top_features to display analyzed functions in the frontend dashboard
-        top_features = []
-        for af in sorted(analyzed_functions, key=lambda x: x["confidence"], reverse=True):
-            status = "Vulnerable" if af["is_vulnerable"] else "Safe"
-            top_features.append({
-                "feature": f"{af['function_name']} ({status})",
-                "importance": af["confidence"],
-                "tfidf_weight": af["nodes_count"]
-            })
-
-        return {
-            "prediction": overall_prediction,
-            "label": overall_label,
-            "confidence": round(overall_confidence, 4),
-            "top_features": top_features,
-            "flagged_functions": flagged_functions,
-            "decision_source": overall_decision_source
-        }
+            return {
+                "prediction": overall_prediction,
+                "label": overall_label,
+                "confidence": round(overall_confidence, 4),
+                "top_features": top_features,
+                "flagged_functions": flagged_functions,
+                "decision_source": overall_decision_source
+            }
 
 
 # Module singleton
