@@ -43,7 +43,7 @@ public class ExtractAllCFGs extends GhidraScript {
             String fname = func.getName();
 
             // Skip default external or library functions to focus on program code
-            if (func.isThunk() || fname.startsWith("sys_") || fname.startsWith("__") || fname.startsWith("_")) {
+            if (func.isThunk() || fname.startsWith("sys_") || fname.startsWith("__")) {
                 continue;
             }
 
@@ -143,7 +143,7 @@ public class ExtractAllCFGs extends GhidraScript {
             }
 
             // Skip empty functions or too small/large functions during indexing
-            if (blockIndex < 2 || blockIndex > 200) {
+            if (blockIndex < 1 || blockIndex > 200) {
                 continue;
             }
 

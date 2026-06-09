@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -397,6 +398,7 @@ Use strong markdown syntax, code snippets, headers, and bullet points. Make it r
 """
 
         logger.info("Invoking Gemini to compile vulnerability report...")
+        time.sleep(15)
         response = self.llm.invoke(prompt)
 
         content = response.content
@@ -446,6 +448,7 @@ Please formulate an elegant, friendly, and expert answer. Structure it with clea
 """
 
         logger.info(f"Invoking Gemini chatbot for query: '{query[:40]}...'")
+        time.sleep(15)
         response = self.llm.invoke(prompt)
         
         content = response.content

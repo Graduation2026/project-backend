@@ -7,6 +7,7 @@ then disassembles instructions to node embeddings and runs GATv2 model inference
 
 import json
 import logging
+import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -143,12 +144,41 @@ def detect_vulnerability_heuristic(nodes) -> bool:
                         has_unsafe_call = True
     return has_unsafe_call
 
+def _word_boundary_match(api_name: str, text: str) -> bool:
+    """Match API name at word boundaries to prevent substring false matches (e.g. 'gets' in 'fgets')."""
+    return bool(re.search(r'(?:^|(?<=[^a-zA-Z0-9_]))' + re.escape(api_name) + r'(?=[^a-zA-Z0-9_]|$)', text))
+
+UNSAFE_APIS = ["strcpy", "strcat", "gets", "sprintf", "scanf"]
+SAFE_APIS = ["strncpy", "strncat", "fgets", "snprintf", "memcpy", "memcpy_s", "memmove"]
+SAFE_CPP_INDICATORS = ["std::", "operator<<", "operator>>", "basic_string", "allocator", "length", "substr", "size"]
+
+# API-to-CWE mapping for dynamic CWE assignment (replaces hardcoded CWE-119)
+CWE_MAPPING = {
+    "strcpy": "CWE-121", "strcat": "CWE-121", "gets": "CWE-121",
+    "sprintf": "CWE-121", "scanf": "CWE-120",
+    "memcpy": "CWE-787", "memmove": "CWE-787",
+    "printf": "CWE-134",
+    "system": "CWE-78", "popen": "CWE-78",
+    "free": "CWE-416", "realloc": "CWE-416",
+    "malloc": "CWE-190", "calloc": "CWE-190",
+}
+
+def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
+    """Scan decompiled code for known API calls and return the most specific CWE."""
+    text = " ".join(decompiled_lines).lower()
+    detected = set()
+    for api, cwe in CWE_MAPPING.items():
+        if _word_boundary_match(api, text):
+            detected.add(cwe)
+    return ", ".join(sorted(detected)) if detected else "CWE-119"
+
 def compute_heuristic_delta(nodes) -> float:
     """
     Checks for unsafe or safe API calls in assembly nodes and returns a probability delta:
     +0.35 if unsafe call is found without safe alternatives.
     -0.25 if only safe calls/CPP containers are found and no unsafe calls.
     0.0 otherwise.
+    Uses word-boundary matching to prevent false matches (e.g. 'gets' vs 'fgets').
     """
     has_unsafe_call = False
     has_safe_call = False
@@ -157,18 +187,18 @@ def compute_heuristic_delta(nodes) -> float:
         for instr in node["instructions"]:
             instr_lower = instr.lower()
             if "call" in instr_lower or "jmp" in instr_lower:
-                # Check for unsafe API calls
-                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
-                    is_safe_alternative = any(sa in instr_lower for sa in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
+                # Check for unsafe API calls using word-boundary matching
+                if any(_word_boundary_match(api, instr_lower) for api in UNSAFE_APIS):
+                    is_safe_alternative = any(_word_boundary_match(sa, instr_lower) for sa in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
                     if not is_safe_alternative:
                         has_unsafe_call = True
                 
                 # Check for safe/hardened APIs
-                if any(x in instr_lower for x in ["strncpy", "strncat", "fgets", "snprintf", "memcpy", "memcpy_s", "memmove"]):
+                if any(_word_boundary_match(api, instr_lower) for api in SAFE_APIS):
                     has_safe_call = True
                 
                 # Check for C++ standard library safe containers/streams
-                if any(x in instr_lower for x in ["std::", "operator<<", "operator>>", "basic_string", "allocator", "length", "substr", "size"]):
+                if any(x in instr_lower for x in SAFE_CPP_INDICATORS):
                     has_safe_call = True
 
     if has_unsafe_call:
@@ -286,13 +316,17 @@ class VulnerabilityPredictor:
 
             # Build node features
             x_list = []
+            total_tokens = 0
+            oov_tokens = 0
             for node in nodes:
                 node_vecs = []
                 for instr in node["instructions"]:
                     # Strip comments (e.g., // strncpy) before tokenizing for Word2Vec
                     instr_clean = instr.split("//")[0]
                     parts = instr_clean.replace(",", " ").replace("[", " ").replace("]", " ").split()
+                    total_tokens += len(parts)
                     valid_parts = [p for p in parts if p in w2v.wv]
+                    oov_tokens += len(parts) - len(valid_parts)
                     if valid_parts:
                         vec = np.mean([w2v.wv[p] for p in valid_parts], axis=0)
                         node_vecs.append(vec)
@@ -302,6 +336,13 @@ class VulnerabilityPredictor:
                 else:
                     node_feat = np.zeros(vector_size)
                 x_list.append(node_feat)
+
+            # OOV tracking — warn if Word2Vec doesn't understand the instruction set
+            oov_rate = oov_tokens / total_tokens if total_tokens > 0 else 0.0
+            if oov_rate > 0.5:
+                logger.warning(f"  High OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%}) — node vectors may be noise-dominated")
+            elif oov_rate > 0.3:
+                logger.info(f"  Moderate OOV rate for {fname}: {oov_tokens}/{total_tokens} tokens ({oov_rate:.1%})")
 
             x = torch.tensor(np.array(x_list), dtype=torch.float).to(self.device)
 
@@ -363,7 +404,8 @@ class VulnerabilityPredictor:
                 "is_vulnerable": is_vuln,
                 "nodes_count": len(nodes),
                 "edges_count": len(edges),
-                "decision_source": func_decision_source
+                "decision_source": func_decision_source,
+                "oov_rate": round(oov_rate, 4)
             }
             analyzed_functions.append(func_info)
 
@@ -385,7 +427,7 @@ class VulnerabilityPredictor:
                     "function_name": fname,
                     "confidence": round(vuln_prob, 4),
                     "decompiled_code": "\n".join(decompiled_lines),
-                    "cwe_id": "CWE-119",  # Fallback memory corruption
+                    "cwe_id": detect_cwe_from_code(decompiled_lines),
                     "brief_explanation": explanation,
                     "decision_source": func_decision_source
                 })

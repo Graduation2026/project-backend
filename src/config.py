@@ -27,17 +27,6 @@ GHIDRA_TIMEOUT_SECONDS = 900  # 15 minutes
 
 # ─── ML MODEL CONFIGURATION ─────────────────────────────────────────────────
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-MODEL_PATH = ARTIFACTS_DIR / "vulnerability_detector_rf.pkl"
-VECTORIZER_PATH = ARTIFACTS_DIR / "tfidf_vectorizer.pkl"
-
-# TF-IDF parameters (must match training)
-TFIDF_MAX_FEATURES = 3000
-TFIDF_NGRAM_RANGE = (1, 2)
-
-# Random Forest parameters
-RF_N_ESTIMATORS = 2500
-RF_RANDOM_STATE = 42
-RF_N_JOBS = -1  # Use all CPU cores
 
 # ─── TRAINING DATA ──────────────────────────────────────────────────────────
 LABELS_CSV = PROJECT_ROOT / "labels_mapping.csv"

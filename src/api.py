@@ -197,7 +197,8 @@ async def model_info():
         return {
             "accuracy": 0,
             "total_samples": 0,
-            "n_estimators": 0,
+            "folds": 0,
+            "gnn_layers": 0,
             "trained_at": "Not trained yet",
         }
     with open(meta_path, "r") as f:
@@ -214,7 +215,7 @@ async def analyze_binary(file: UploadFile = File(...)):
     1. Validate the file type (.c and .cpp files are auto-compiled on the fly)
     2. Run Ghidra headless reverse engineering
     3. Extract assembly features (opcodes)
-    4. Run the trained Random Forest model
+    4. Run the hybrid GNN (GATv2) ensemble + heuristic model
     5. Return a prediction with confidence score
 
     **Accepted formats:** .exe, .o, .elf, .dll, .so, .bin, .c, .cpp, .cc, .h, .hpp

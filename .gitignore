@@ -9,6 +9,7 @@ ENV/
 temp/
 ghidra_projects/
 ghidra_output/
+src/static/reports/
 *.log
 .DS_Store
 .vscode/
