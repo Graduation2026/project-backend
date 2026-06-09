@@ -215,7 +215,7 @@ class VulnerabilityPredictor:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._gnn_models = {}  # Dictionary to hold all active fold models
         self._w2v_model = None
         self._is_loaded = False
