@@ -60,7 +60,15 @@ class ReportGenerationService:
             logger.info("✅ Context-enriched report service initialized successfully.")
 
     def seed_db_if_empty(self):
-        """Loads CWE security guidelines, CERT C coding standards, compiler defenses, and exploit mechanics from the knowledge_base/ directory into the vector store."""
+        """Seeds the vector store from the knowledge_base/ directory.
+
+        This is a curated threat intelligence library of CWE, CERT C, compiler
+        hardening, and exploitation mechanics documents stored as Markdown files.
+        The collection is designed as a static snapshot for reproducibility — in
+        production deployments, this can be dynamically expanded by adding new
+        .md files to the knowledge_base/ directory or wiring in external feeds
+        (OSV, NVD, VulnDB) without any code changes.
+        """
         try:
             count = len(self.vector_store.get()["ids"])
         except Exception:

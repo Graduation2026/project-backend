@@ -60,7 +60,7 @@ class VulnGNN(torch.nn.Module):
 
 # --- Boilerplate Symbol Blacklist ---
 BOILERPLATE_BLACKLIST = {
-    # MinGW CRT & Windows Startup
+    # MinGW/GCC CRT & Windows Startup
     "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init",
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
@@ -68,6 +68,22 @@ BOILERPLATE_BLACKLIST = {
     # Linux ELF Startup
     "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
     "__libc_csu_fini", "_dl_relocate_static_pie",
+    # MSVC CRT & Windows Startup
+    "__scrt_common_main_seh", "_mainCRTStartup", "_wmainCRTStartup", "_WinMainCRTStartup",
+    "_DllMainCRTStartup", "__security_init_cookie", "__security_check_cookie",
+    "__report_gsfailure", "__local_stdio_printf_options", "__local_stdio_scanf_options",
+    "_wsplitpath_s", "_vsnprintf_l", "_RTC_Initialize", "_RTC_Shutdown", "_RTC_Failure",
+    "__scrt_initialize_crt", "__scrt_initialize_onexit_table", "__scrt_is_non_image_rva",
+    "__scrt_is_safe_divisor", "__scrt_is_user_matherr_present", "__scrt_narrow_argv_policy",
+    "__scrt_perform_file_alignments", "__scrt_perform_image_alignments",
+    "__scrt_stub_for_initialize_mta", "__scrt_stub_for_is_c_image",
+    "__scrt_stub_for_resolve_heap_functions", "__scrt_stub_for_is_non_image_rva",
+    "__scrt_stub_for_is_safe_divisor", "__scrt_stub_for_is_user_matherr_present",
+    "__scrt_stub_for_narrow_argv_policy", "__scrt_stub_for_perform_file_alignments",
+    "__scrt_stub_for_perform_image_alignments", "__vcrt_initialize", "__vcrt_uninitialize",
+    "__vcrt_thread_attach", "__vcrt_thread_detach", "__telemetry_main_invoke_trigger",
+    "__telemetry_main_return_trigger", "_CRT_INIT", "_DllMain", "DllMain", "_CRT_INIT@12",
+    "__dyn_tls_init", "__dyn_tls_dtor",
 }
 
 CPP_LIB_KEYWORDS = {
@@ -85,16 +101,40 @@ def is_boilerplate_or_lib(fname: str) -> bool:
     # Check exact matches
     if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS:
         return True
-    # Check prefixes/substrings for compiler boilerplate
-    if fname.startswith("__") or fname.startswith("_Z") or fname.startswith("glob"):
-        if not (fname.startswith("__main") or fname.startswith("main")):
-            if any(x in fname for x in ["CRT", "mingw", "tm_clones", "frame_dummy"]):
-                return True
-            if fname.startswith("_Z"): # C++ mangled names
-                if any(x in fname for x in ["std::", "NSt7", "allocator", "basic_string", "string"]):
-                    return True
-    if any(x in fname for x in ["std::", "std::allocator", "std::basic_string", "~_Guard", "basic_string"]):
+    
+    # Exclude user main functions from blacklist checking
+    if fname.startswith("__main") or fname.startswith("main"):
+        return False
+
+    # Check prefixes/substrings for compiler and library boilerplate
+    # MSVC: __scrt_, __vcrt_, _RTC_, __local_stdio_
+    if fname.startswith("__scrt_") or fname.startswith("__vcrt_") or fname.startswith("__local_stdio_") or "_RTC_" in fname:
         return True
+
+    # Exception handling/runtimes: C++ ABI (_cxa_), Unwind, personality routines
+    if any(x in fname for x in ["_cxa_", "_Unwind_", "personality", "__gcc_", "__gxx_"]):
+        return True
+
+    # Stack protectors/canaries
+    if "__stack_chk" in fname or "__security_" in fname:
+        return True
+
+    # Compiler intrinsics / builtins
+    if fname.startswith("__builtin_"):
+        return True
+
+    # General compiler / runtime prefixes
+    if fname.startswith("__") or fname.startswith("_Z") or fname.startswith("glob"):
+        if any(x in fname for x in ["CRT", "mingw", "tm_clones", "frame_dummy"]):
+            return True
+        if fname.startswith("_Z"): # C++ mangled names
+            if any(x in fname for x in ["std::", "NSt7", "allocator", "basic_string", "string", "vector", "list", "map", "set", "char_traits"]):
+                return True
+
+    # Standard template library (STL) namespace/keyword matching
+    if any(x in fname for x in ["std::", "std__", "std::allocator", "std::basic_", "~_Guard", "basic_string", "allocator", "__gnu_cxx"]):
+        return True
+
     return False
 
 def verify_vulnerability_heuristic(nodes) -> bool:

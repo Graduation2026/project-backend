@@ -33,6 +33,8 @@ class GhidraError(Exception):
     pass
 
 
+import time
+
 # Simple file lock to prevent duplicate concurrent analysis of the same binary
 _LOCK_DIR = None
 
@@ -43,19 +45,26 @@ def _get_lock_dir():
     return _LOCK_DIR
 
 def _acquire_binary_lock(binary_path: Path) -> str:
-    """Create a lock file for the binary's canonical path to prevent duplicate concurrent analysis."""
+    """Create a lock file for the binary's canonical path to prevent duplicate concurrent analysis, waiting if locked."""
     lock_dir = _get_lock_dir()
     lock_name = "lock_" + binary_path.resolve().as_posix().replace("/", "_").replace(":", "") + ".lock"
     lock_path = lock_dir / lock_name
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL)
-        os.close(fd)
-        return str(lock_path)
-    except FileExistsError:
-        raise GhidraError(
-            f"Binary '{binary_path.name}' is already being analyzed. "
-            "Please wait for the current analysis to complete."
-        )
+    
+    timeout = 120  # Wait up to 2 minutes
+    start_time = time.time()
+    
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL)
+            os.close(fd)
+            return str(lock_path)
+        except FileExistsError:
+            if time.time() - start_time > timeout:
+                raise GhidraError(
+                    f"Timeout waiting for binary '{binary_path.name}' to finish its current analysis."
+                )
+            logger.info(f"Binary '{binary_path.name}' is currently being analyzed. Waiting in queue...")
+            time.sleep(1)
 
 def _release_binary_lock(lock_path: str):
     try:

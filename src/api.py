@@ -144,6 +144,9 @@ def compile_source(source_path: Path, output_o_path: Path) -> Path:
     - Temp directories are cleaned up in finally block
     - Header files (.h/.hpp) have static/inline removed to force symbol emission
     - Output is copied out of the isolated directory, then the directory is destroyed
+    - Prototype sandbox: uses temp dir + timeout + cleanup. Production deployments
+      should use Docker containers (read-only root FS, CPU/memory cgroups,
+      no-network) for true multi-tenant sandbox isolation.
     """
     file_ext = source_path.suffix.lower()
     is_header = file_ext in [".h", ".hpp"]
