@@ -97,7 +97,7 @@ def is_boilerplate_or_lib(fname: str) -> bool:
 
 def verify_vulnerability_heuristic(nodes) -> bool:
     """
-    Returns True if the GNN flagged vulnerability should be kept.
+    [Deprecated] Returns True if the GNN flagged vulnerability should be kept.
     Returns False if it is a verified safe implementation (e.g. only safe APIs, no unsafe APIs).
     """
     has_unsafe_call = False
@@ -129,7 +129,7 @@ def verify_vulnerability_heuristic(nodes) -> bool:
 
 def detect_vulnerability_heuristic(nodes) -> bool:
     """
-    Returns True if the function contains known unsafe calls without safe alternatives,
+    [Deprecated] Returns True if the function contains known unsafe calls without safe alternatives,
     indicating it should be classified as Vulnerable regardless of GNN score.
     """
     has_unsafe_call = False
@@ -143,6 +143,40 @@ def detect_vulnerability_heuristic(nodes) -> bool:
                         has_unsafe_call = True
     return has_unsafe_call
 
+def compute_heuristic_delta(nodes) -> float:
+    """
+    Checks for unsafe or safe API calls in assembly nodes and returns a probability delta:
+    +0.35 if unsafe call is found without safe alternatives.
+    -0.25 if only safe calls/CPP containers are found and no unsafe calls.
+    0.0 otherwise.
+    """
+    has_unsafe_call = False
+    has_safe_call = False
+    
+    for node in nodes:
+        for instr in node["instructions"]:
+            instr_lower = instr.lower()
+            if "call" in instr_lower or "jmp" in instr_lower:
+                # Check for unsafe API calls
+                if any(x in instr_lower for x in ["strcpy", "strcat", "gets", "sprintf", "scanf"]):
+                    is_safe_alternative = any(sa in instr_lower for sa in ["strncpy", "strncat", "snprintf", "sprintf_s", "strcpy_s"])
+                    if not is_safe_alternative:
+                        has_unsafe_call = True
+                
+                # Check for safe/hardened APIs
+                if any(x in instr_lower for x in ["strncpy", "strncat", "fgets", "snprintf", "memcpy", "memcpy_s", "memmove"]):
+                    has_safe_call = True
+                
+                # Check for C++ standard library safe containers/streams
+                if any(x in instr_lower for x in ["std::", "operator<<", "operator>>", "basic_string", "allocator", "length", "substr", "size"]):
+                    has_safe_call = True
+
+    if has_unsafe_call:
+        return 0.35
+    elif has_safe_call:
+        return -0.25
+    return 0.0
+
 
 class VulnerabilityPredictor:
     """
@@ -150,7 +184,7 @@ class VulnerabilityPredictor:
     """
 
     def __init__(self):
-        self._gnn_model = None
+        self._gnn_models = {}  # Dictionary to hold all active fold models
         self._w2v_model = None
         self._is_loaded = False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -160,7 +194,7 @@ class VulnerabilityPredictor:
         self.gnn_path = Path(__file__).resolve().parent.parent / "artifacts" / "best_fold4.pt"
 
     def load_models(self):
-        """Load Word2Vec and trained GNN weights."""
+        """Load Word2Vec and trained GNN weights (with ensemble folds if available)."""
         if self._is_loaded:
             return
 
@@ -172,14 +206,35 @@ class VulnerabilityPredictor:
         logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
         self._w2v_model = Word2Vec.load(str(self.w2v_path))
 
-        logger.info(f"Loading PyTorch GNN model onto {self.device}...")
-        self._gnn_model = VulnGNN(input_dim=128, hidden_dim=64)
-        self._gnn_model.load_state_dict(torch.load(str(self.gnn_path), map_location=self.device, weights_only=True))
-        self._gnn_model.to(self.device)
-        self._gnn_model.eval()
+        # Determine folds to load with graceful fallback
+        model_paths = {
+            "fold4": self.gnn_path  # Fold 4 is always required
+        }
+        fold0_path = self.gnn_path.parent / "best_fold0.pt"
+        fold1_path = self.gnn_path.parent / "best_fold1.pt"
+        
+        if fold0_path.exists():
+            model_paths["fold0"] = fold0_path
+        if fold1_path.exists():
+            model_paths["fold1"] = fold1_path
+
+        logger.info(f"Initializing GNN models from loaded paths: {list(model_paths.keys())}...")
+        
+        for fold_name, path in model_paths.items():
+            try:
+                model = VulnGNN(input_dim=128, hidden_dim=64)
+                model.load_state_dict(torch.load(str(path), map_location=self.device, weights_only=True))
+                model.to(self.device)
+                model.eval()
+                self._gnn_models[fold_name] = model
+                logger.info(f"✅ Loaded GNN {fold_name} weights successfully.")
+            except Exception as e:
+                logger.error(f"❌ Failed to load GNN {fold_name} weights from {path}: {e}")
+                if fold_name == "fold4":
+                    raise e  # Fail hard if the primary fold fails
 
         self._is_loaded = True
-        logger.info("✅ GNN & Word2Vec models loaded successfully.")
+        logger.info(f"✅ GNN & Word2Vec models loaded successfully. Active folds: {list(self._gnn_models.keys())}")
 
     @property
     def is_loaded(self) -> bool:
@@ -211,7 +266,8 @@ class VulnerabilityPredictor:
                 "label": 0,
                 "confidence": 1.0,
                 "top_features": [],
-                "flagged_functions": []
+                "flagged_functions": [],
+                "decision_source": "gnn"
             }
 
         analyzed_functions = []
@@ -261,32 +317,38 @@ class VulnerabilityPredictor:
                 safe_prob = 1.0
                 is_vuln = False
                 confidence = 1.0
+                func_decision_source = "gnn"
             else:
-                # Run GNN model
+                # Run ensemble GNN models
                 batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
+                probs_list = []
                 with torch.no_grad():
-                    out = self._gnn_model(x, edge_index, batch)
-                    probs = torch.softmax(out, dim=1)[0]
-                    vuln_prob = float(probs[1])
-                    safe_prob = float(probs[0])
+                    for fold_name, model in self._gnn_models.items():
+                        out = model(x, edge_index, batch)
+                        probs = torch.softmax(out, dim=1)[0]
+                        probs_list.append(probs)
+                
+                # Average probabilities across loaded folds
+                avg_probs = torch.stack(probs_list).mean(dim=0)
+                gnn_avg_vuln_prob = float(avg_probs[1])
+                gnn_avg_safe_prob = float(avg_probs[0])
 
+                # Compute soft heuristic fusion with GNN uncertainty gating
+                heuristic_delta = compute_heuristic_delta(nodes)
+                
+                # GNN Uncertainty: 1.0 when at 0.5 (perfect uncertainty), 0.0 when at 0.0 or 1.0 (perfect certainty)
+                uncertainty = 1.0 - abs(gnn_avg_vuln_prob - 0.5) * 2.0
+                effective_delta = heuristic_delta * uncertainty
+                
+                # Final blended probability (clamped to [0.01, 0.99] to avoid absolute certainty claims)
+                vuln_prob = max(0.01, min(0.99, gnn_avg_vuln_prob + effective_delta))
+                safe_prob = 1.0 - vuln_prob
+                
                 is_vuln = vuln_prob > 0.5
-                
-                # Apply heuristic verification override
-                if is_vuln:
-                    if not verify_vulnerability_heuristic(nodes):
-                        # Override GNN decision to Safe!
-                        vuln_prob = 0.30
-                        safe_prob = 0.70
-                        is_vuln = False
-                else:
-                    if detect_vulnerability_heuristic(nodes):
-                        # Override GNN decision to Vulnerable!
-                        vuln_prob = 0.85
-                        safe_prob = 0.15
-                        is_vuln = True
-                
                 confidence = vuln_prob if is_vuln else safe_prob
+                
+                # Decision source tracking: hybrid if delta shifted/nudge was applied significantly (>0.02)
+                func_decision_source = "hybrid" if abs(vuln_prob - gnn_avg_vuln_prob) > 0.02 else "gnn"
 
             # Formulate decompiled / disassembled preview for RAG context
             decompiled_lines = []
@@ -300,7 +362,8 @@ class VulnerabilityPredictor:
                 "confidence": round(confidence, 4),
                 "is_vulnerable": is_vuln,
                 "nodes_count": len(nodes),
-                "edges_count": len(edges)
+                "edges_count": len(edges),
+                "decision_source": func_decision_source
             }
             analyzed_functions.append(func_info)
 
@@ -309,12 +372,22 @@ class VulnerabilityPredictor:
                 if vuln_prob > max_vuln_confidence:
                     max_vuln_confidence = vuln_prob
 
+                # Dynamic explanation based on active folds
+                num_folds = len(self._gnn_models)
+                if num_folds > 1:
+                    folds_list = sorted([k.replace("fold", "") for k in self._gnn_models.keys()])
+                    active_folds_str = ",".join(folds_list)
+                    explanation = f"Ensemble of {num_folds} GATv2 models (folds {active_folds_str}) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+                else:
+                    explanation = f"GATv2 GNN model (fold 4) with heuristic confidence weighting classified this function as vulnerable with {confidence:.1%} confidence."
+
                 flagged_functions.append({
                     "function_name": fname,
                     "confidence": round(vuln_prob, 4),
                     "decompiled_code": "\n".join(decompiled_lines),
                     "cwe_id": "CWE-119",  # Fallback memory corruption
-                    "brief_explanation": f"GNN model GATv2 classified this function as highly suspicious of memory safety vulnerabilities (e.g. CWE-119, CWE-120 buffer overflows) with {vuln_prob:.1%} confidence."
+                    "brief_explanation": explanation,
+                    "decision_source": func_decision_source
                 })
             else:
                 if safe_prob > max_safe_confidence:
@@ -323,6 +396,12 @@ class VulnerabilityPredictor:
         overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
         overall_label = 1 if overall_vulnerable else 0
         overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
+
+        # Determine overall decision source (hybrid if any flagged function is hybrid)
+        overall_decision_source = "gnn"
+        if flagged_functions:
+            if any(f["decision_source"] == "hybrid" for f in flagged_functions):
+                overall_decision_source = "hybrid"
 
         # Format top_features to display analyzed functions in the frontend dashboard
         top_features = []
@@ -339,7 +418,8 @@ class VulnerabilityPredictor:
             "label": overall_label,
             "confidence": round(overall_confidence, 4),
             "top_features": top_features,
-            "flagged_functions": flagged_functions
+            "flagged_functions": flagged_functions,
+            "decision_source": overall_decision_source
         }
 
 
