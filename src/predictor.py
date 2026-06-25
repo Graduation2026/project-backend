@@ -61,7 +61,10 @@ class VulnGNN(torch.nn.Module):
 # --- Boilerplate Symbol Blacklist ---
 BOILERPLATE_BLACKLIST = {
     # MinGW/GCC CRT & Windows Startup
-    "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init",
+    "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init", "pre_cpp_init", "_pre_cpp_init",
+    "_get_output_format", "__deregister_frame_info", "__register_frame_info", "_register_frame_info", "_deregister_frame_info",
+    ".weak.__deregister_frame_info.hmod_libgcc", ".weak.__register_frame_info.hmod_libgcc",
+    "__mingw_invalidParameterHandler", "__mingw_raise_exception",
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
     "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
@@ -79,8 +82,8 @@ BOILERPLATE_BLACKLIST = {
     "__scrt_stub_for_initialize_mta", "__scrt_stub_for_is_c_image",
     "__scrt_stub_for_resolve_heap_functions", "__scrt_stub_for_is_non_image_rva",
     "__scrt_stub_for_is_safe_divisor", "__scrt_stub_for_is_user_matherr_present",
-    "__scrt_stub_for_narrow_argv_policy", "__scrt_stub_for_perform_file_alignments",
-    "__scrt_stub_for_perform_image_alignments", "__vcrt_initialize", "__vcrt_uninitialize",
+    "__scrt_narrow_argv_policy", "__scrt_perform_file_alignments",
+    "__scrt_perform_image_alignments", "__vcrt_initialize", "__vcrt_uninitialize",
     "__vcrt_thread_attach", "__vcrt_thread_detach", "__telemetry_main_invoke_trigger",
     "__telemetry_main_return_trigger", "_CRT_INIT", "_DllMain", "DllMain", "_CRT_INIT@12",
     "__dyn_tls_init", "__dyn_tls_dtor",
@@ -97,14 +100,41 @@ CPP_LIB_KEYWORDS = {
     "__throw_out_of_range_fmt"
 }
 
+# These are standard C library symbols that may appear as extracted functions
+# in statically linked binaries. They are external trusted code resolved via
+# PLT/IAT — not user-defined functions — and should bypass GNN analysis.
+STANDARD_LIBC_IMPORTS = {
+    # Format/IO
+    "printf", "fprintf", "sprintf", "snprintf", "scanf", "sscanf", "fscanf", "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+    # Memory
+    "malloc", "free", "realloc", "calloc", "memset", "memcpy", "memmove", "memcmp",
+    # Strings
+    "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp", "strlen", "strchr", "strstr", "strspn", "strcspn",
+    # Other
+    "atoi", "atol", "atof", "strtol", "strtoul", "exit", "abort"
+}
+
 def is_boilerplate_or_lib(fname: str) -> bool:
     # Check exact matches
-    if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS:
+    if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS or fname in STANDARD_LIBC_IMPORTS:
         return True
     
+    # Strip leading underscores and check exact lists
+    fname_clean = fname.lstrip('_')
+    if fname_clean in STANDARD_LIBC_IMPORTS or fname_clean in BOILERPLATE_BLACKLIST:
+        return True
+
     # Exclude user main functions from blacklist checking
     if fname == "main" or fname == "__main" or fname.startswith("main_") or fname.startswith("__main_"):
         return False
+
+    # Check for weak symbol patterns (variable suffixes)
+    if fname.startswith(".weak.") or fname.startswith(".weak_"):
+        return True
+
+    # Check for MSVC standard I/O wrappers and related runtime stubs
+    if fname.startswith("__stdio_common_") or "frame_info" in fname or "_hmod_libgcc" in fname:
+        return True
 
     # Check C++ standard library substrings directly (demangled STL symbols)
     STL_SUBSTRINGS = {"_Tuple", "tuple", "unique_ptr", "_Head_base", "_M_construct", "_M_dispose", "~_Alloc_hider", "_M_head", "std::", "basic_string", "allocator", "_Alloc_hider"}
@@ -169,6 +199,19 @@ def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
         if _word_boundary_match(api, text):
             detected.add(cwe)
     return ", ".join(sorted(detected)) if detected else "CWE-119"
+
+
+def is_trivial_stub(fname: str, nodes: list) -> bool:
+    """Detect if a function is a trivial compiler-generated stub (starts with FUN_, <= 1 block, no calls)."""
+    if not fname.startswith("FUN_"):
+        return False
+    for node in nodes:
+        for instr in node.get("instructions", []):
+            if "CALL" in instr or "call" in instr:
+                return False
+    if len(nodes) <= 1:
+        return True
+    return False
 
 
 class VulnerabilityPredictor:
@@ -312,12 +355,12 @@ class VulnerabilityPredictor:
                     edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
 
                 # Check if symbol is compiler boilerplate
-                if is_boilerplate_or_lib(fname):
+                if is_boilerplate_or_lib(fname) or is_trivial_stub(fname, nodes):
                     vuln_prob = 0.0
                     safe_prob = 1.0
                     is_vuln = False
                     confidence = 1.0
-                    func_decision_source = "gnn"
+                    func_decision_source = "boilerplate"
                 else:
                     # Run GNN on every function regardless of size
                     batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
@@ -403,7 +446,7 @@ class VulnerabilityPredictor:
             overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
 
             # Determine overall decision source
-            decision_sources = [af["decision_source"] for af in analyzed_functions if not is_boilerplate_or_lib(af["function_name"])]
+            decision_sources = [af["decision_source"] for af in analyzed_functions if af["decision_source"] != "boilerplate"]
             if "rescue" in decision_sources and not overall_vulnerable:
                 overall_decision_source = "rescue"
             else:

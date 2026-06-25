@@ -1,7 +1,9 @@
 import os
-import time
 import logging
 import threading
+
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, before_sleep_log
+from google.api_core.exceptions import ResourceExhausted, TooManyRequests
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -27,6 +29,17 @@ class ReportGenerationService:
         self.vector_store = None
         self.llm = None
         self._is_initialized = False
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        stop=stop_after_attempt(5),
+        retry=retry_if_exception_type((ResourceExhausted, TooManyRequests)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True
+    )
+    def _invoke_llm_with_retry(self, prompt: str):
+        """Invoke the LLM with exponential backoff on rate-limit errors."""
+        return self.llm.invoke(prompt)
 
     def initialize(self):
         """Initializes the embeddings, vector store, and Gemini LLM (thread-safe)."""
@@ -114,7 +127,30 @@ class ReportGenerationService:
         """
         self.initialize()
 
-        is_vulnerable = len(flagged_functions) > 0
+        flagged_count = len(flagged_functions)
+        is_vulnerable = flagged_count > 0
+        percentage = (flagged_count / total_functions * 100) if total_functions > 0 else 0.0
+
+        if percentage == 0.0:
+            verdict = f"0 vulnerabilities found out of {total_functions} functions"
+            risk_level = "LOW (Green)"
+            color_tier = "Green"
+            severity_level = "LOW"
+        elif percentage <= 25.0:
+            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            risk_level = "MEDIUM (Yellow)"
+            color_tier = "Yellow"
+            severity_level = "MEDIUM"
+        elif percentage <= 50.0:
+            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            risk_level = "HIGH (Orange)"
+            color_tier = "Orange"
+            severity_level = "HIGH"
+        else:
+            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            risk_level = "CRITICAL (Red)"
+            color_tier = "Red"
+            severity_level = "CRITICAL"
 
         # Retrieve reference guidelines from Chroma DB
         retrieved_docs = []
@@ -145,7 +181,6 @@ class ReportGenerationService:
             for idx, func in enumerate(top_critical):
                 functions_context += (
                     f"### Finding {idx + 1}: Function `{func['function_name']}`\n"
-                    f"- **Model Confidence:** {func['confidence']:.2%}\n"
                     f"- **Identified Threat:** {func.get('cwe_id', 'CWE-119')} (Memory Safety / Buffer Overflow)\n"
                     f"- **Model Explanation:** {func['brief_explanation']}\n"
                     f"- **Disassembled CFG Code Blocks:**\n"
@@ -166,8 +201,8 @@ Below is the context retrieved from secure coding databases (SEI CERT C / CWE) a
 ### SECURITY METADATA:
 - **Filename**: {filename}
 - **SHA-256 Checksum**: {sha256_hash}
-- **Verdict**: {"VULNERABLE" if is_vulnerable else "SAFE"}
-- **Risk Level**: {"CRITICAL" if is_vulnerable else "LOW"}
+- **Verdict**: {verdict}
+- **Risk Level**: {risk_level}
 - **Total Functions Evaluated**: {total_functions}
 
 ### SECURITY STANDARDS CONTEXT:
@@ -181,27 +216,28 @@ Please draft a gorgeous Markdown document including:
 2. **Audit Metadata Labeled List**: Display the security metadata cleanly using a bolded list (do NOT use markdown tables to ensure clean PDF compiling compatibility):
    - **Filename**: {filename}
    - **SHA-256 Checksum**: {sha256_hash}
-   - **Verdict**: {"VULNERABLE" if is_vulnerable else "SAFE"}
-   - **Risk Level**: {"CRITICAL" if is_vulnerable else "LOW"}
+   - **Verdict**: {verdict}
+   - **Risk Level**: {risk_level}
    - **Total Functions Evaluated**: {total_functions}
 3. **Executive Summary**: Write a professional executive summary explaining the verdict and scope of the audit.
-   - For SAFE results: explain that all function Control Flow Graphs (CFGs) were checked and conform to standard coding rules.
-   - For VULNERABLE results: explain the threat vectors and the urgency of the remediation.
-4. **Analysis Metrics**: Detail the static analysis parameters, total function count, and average confidence of the checks.
+   - For 0 vulnerabilities found: explain that all function Control Flow Graphs (CFGs) were checked and conform to standard coding rules. No vulnerabilities were detected.
+   - For cases with vulnerabilities (Yellow, Orange, Red tiers): explain the threat vectors found and the urgency of the remediation. Use the custom tier name ({color_tier}) and severity ({severity_level}) appropriately.
+   - Do NOT use the big word "VULNERABLE" or "CLEAN" anywhere in the document, especially for headers or big verdicts. Instead, use "{verdict}" to describe the verdict.
+4. **Analysis Metrics**: Detail the static analysis parameters, total function count, and number of flagged functions. Do NOT show or include any model confidence levels or percentages.
 5. **Detailed Findings Section**:
-   - For SAFE results: state "No security flaws or rule violations were flagged." List the checked functions as safe.
-   - For VULNERABLE results: provide a detailed breakdown for each flagged function, containing:
+   - For 0 vulnerabilities found: state "No security flaws or rule violations were flagged." List the checked functions as safe.
+   - For cases with vulnerabilities: provide a detailed breakdown for each flagged function, containing:
      - Technical breakdown of the exploit vector (how the instructions represent buffer overflows or out-of-bounds writes).
      - The SEI CERT C coding rule violated.
      - **Remediation & Secure Code Fix**: Provide a clear, correct rewrite of the vulnerable concept in C/C++ showing secure library usage (e.g. using `strncat` or boundary bounds checks).
+     - Do NOT display or print any confidence levels or model confidence percentages for the findings.
 6. **General Mitigations**: Highlight best practices for compilation (canaries, DEP, ASLR, Control Flow Integrity) and security testing.
 
 Use strong markdown syntax, code snippets, headers, and bullet points. Make it read like a premium security consultancy report.
 """
 
         logger.info("Invoking Gemini to compile security report...")
-        time.sleep(15)
-        response = self.llm.invoke(prompt)
+        response = self._invoke_llm_with_retry(prompt)
 
         content = response.content
         if isinstance(content, list):
@@ -210,12 +246,14 @@ Use strong markdown syntax, code snippets, headers, and bullet points. Make it r
         logger.info("Vulnerability report successfully compiled!")
         return report_markdown
 
-    def get_chat_response(self, query: str, decompiled_code: str, chat_history: list[dict] = []) -> str:
+    def get_chat_response(self, query: str, decompiled_code: str, chat_history: list[dict] | None = None) -> str:
         """
         Handles real-time chatbot queries. Contextualizes the answer with the preloaded Reference DB
         and the specific decompiled function context under discussion.
         """
         self.initialize()
+        if chat_history is None:
+            chat_history = []
 
         # Retrieve relevant CWE standards
         docs = self.vector_store.similarity_search(query, k=2)
@@ -250,8 +288,7 @@ Please formulate an elegant, friendly, and expert answer. Structure it with clea
 """
 
         logger.info(f"Invoking Gemini chatbot for query: '{query[:40]}...'")
-        time.sleep(15)
-        response = self.llm.invoke(prompt)
+        response = self._invoke_llm_with_retry(prompt)
         
         content = response.content
         if isinstance(content, list):
