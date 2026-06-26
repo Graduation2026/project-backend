@@ -68,6 +68,12 @@ BOILERPLATE_BLACKLIST = {
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
     "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
+    
+    # MinGW / GCC Windows Extras (User Provided)
+    "_pei386_runtime_relocator", "_FindPESection", "_FindPESectionByName",
+    "_FindPESectionExec", "_GetPEImageBase", "_IsNonwritableInCurrentImage",
+    "_onexit", "_amsg_exit", "_tzset", "tzset", "_get_output_format", "FUN_140001000",
+    
     # Linux ELF Startup
     "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
     "__libc_csu_fini", "_dl_relocate_static_pie",
@@ -181,7 +187,6 @@ CWE_MAPPING = {
     "strcpy": "CWE-121", "strcat": "CWE-121", "gets": "CWE-121",
     "sprintf": "CWE-121", "scanf": "CWE-120",
     "memcpy": "CWE-787", "memmove": "CWE-787",
-    "printf": "CWE-134",
     "system": "CWE-78", "popen": "CWE-78",
     "free": "CWE-416", "realloc": "CWE-416",
     "malloc": "CWE-190", "calloc": "CWE-190",
