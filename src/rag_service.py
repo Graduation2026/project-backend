@@ -116,38 +116,43 @@ class ReportGenerationService:
 
     def generate_vulnerability_report(
         self,
+        category_a_functions: list[dict],
+        category_b_functions: list[dict],
         flagged_functions: list[dict],
         filename: str = "Unknown",
         sha256_hash: str = "Unknown",
-        total_functions: int = 0
+        total_functions: int = 0,
+        actual_count: int = 0,
+        boilerplate_count: int = 0,
     ) -> str:
         """
         Retrieves reference standards from the knowledge base and generates a comprehensive Markdown
-        security report for the scanned file (supporting both safe and vulnerable verdicts).
+        security report for the scanned file. Always invoked (both safe and vulnerable verdicts).
+        Groups functions into Category B (actual code, detailed) and Category A (boilerplate, names only).
         """
         self.initialize()
 
         flagged_count = len(flagged_functions)
         is_vulnerable = flagged_count > 0
-        percentage = (flagged_count / total_functions * 100) if total_functions > 0 else 0.0
+        percentage = (flagged_count / actual_count * 100) if actual_count > 0 else 0.0
 
         if percentage == 0.0:
-            verdict = f"0 vulnerabilities found out of {total_functions} functions"
+            verdict = f"0 vulnerabilities found out of {actual_count} actual code functions"
             risk_level = "LOW (Green)"
             color_tier = "Green"
             severity_level = "LOW"
         elif percentage <= 25.0:
-            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            verdict = f"{flagged_count} vulnerabilities found out of {actual_count} actual code functions"
             risk_level = "MEDIUM (Yellow)"
             color_tier = "Yellow"
             severity_level = "MEDIUM"
         elif percentage <= 50.0:
-            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            verdict = f"{flagged_count} vulnerabilities found out of {actual_count} actual code functions"
             risk_level = "HIGH (Orange)"
             color_tier = "Orange"
             severity_level = "HIGH"
         else:
-            verdict = f"{flagged_count} vulnerabilities found out of {total_functions} functions"
+            verdict = f"{flagged_count} vulnerabilities found out of {actual_count} actual code functions"
             risk_level = "CRITICAL (Red)"
             color_tier = "Red"
             severity_level = "CRITICAL"
@@ -155,9 +160,8 @@ class ReportGenerationService:
         # Retrieve reference guidelines from Chroma DB
         retrieved_docs = []
         if is_vulnerable:
-            # Sort flagged functions by confidence and limit detailed analysis to top 10 critical ones
-            critical_functions = sorted(flagged_functions, key=lambda x: x["confidence"], reverse=True)
-            top_critical = critical_functions[:10]
+            # Sort flagged functions by CWE and limit detailed analysis to top 10 critical ones
+            top_critical = flagged_functions[:10]
             unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in top_critical)
             for cwe in unique_cwes:
                 query = f"CWE memory corruption {cwe} buffer overflow out of bounds write"
@@ -173,24 +177,41 @@ class ReportGenerationService:
 
         reference_context = "\n\n".join(set(retrieved_docs))
 
-        # Format details of functions under analysis
-        if is_vulnerable:
-            functions_context = f"**Total Flagged Functions:** {len(flagged_functions)}\n"
-            if len(flagged_functions) > 10:
-                functions_context += f"*(Showing detailed security audit for the top 10 most critical findings)*\n\n"
-            for idx, func in enumerate(top_critical):
-                functions_context += (
-                    f"### Finding {idx + 1}: Function `{func['function_name']}`\n"
-                    f"- **Identified Threat:** {func.get('cwe_id', 'CWE-119')} (Memory Safety / Buffer Overflow)\n"
-                    f"- **Model Explanation:** {func['brief_explanation']}\n"
-                    f"- **Disassembled CFG Code Blocks:**\n"
-                    f"```\n{func['decompiled_code']}\n```\n\n"
+        # --- Format Category B (Actual Code Functions) context ---
+        category_b_context = f"**Actual Code Functions Analyzed (Category B): {actual_count}**\n\n"
+        for idx, func in enumerate(category_b_functions):
+            fname = func["function_name"]
+            if func["is_vulnerable"]:
+                # Find matching flagged function for full details
+                flagged_match = next((f for f in flagged_functions if f["function_name"] == fname), None)
+                cwe_id = func.get("cwe_id", "CWE-119")
+                category_b_context += (
+                    f"### Function {idx + 1}: `{fname}` — ⚠️ VULNERABLE\n"
+                    f"- **Status:** Vulnerable\n"
+                    f"- **Identified Threat:** {cwe_id} (Memory Safety / Buffer Overflow)\n"
+                    f"- **Model Explanation:** {func.get('explanation', 'GNN model classified this function as vulnerable.')}\n"
                 )
-        else:
-            functions_context = (
-                f"**Total Flagged Functions:** 0\n"
-                f"No functions were flagged as suspicious or vulnerable by the GNN model.\n"
-                f"All {total_functions} functions analyzed conform to the secure coding baselines."
+                if flagged_match and flagged_match.get("decompiled_code"):
+                    category_b_context += (
+                        f"- **Disassembled CFG Code Blocks:**\n"
+                        f"```\n{flagged_match['decompiled_code']}\n```\n\n"
+                    )
+            else:
+                category_b_context += (
+                    f"### Function {idx + 1}: `{fname}` — ✅ Safe\n"
+                    f"- **Status:** Safe\n"
+                    f"- **Security Validation:** {func.get('explanation', 'No unsafe patterns detected.')}\n\n"
+                )
+
+        # --- Format Category A (Boilerplate & Runtime Stubs) context ---
+        category_a_context = ""
+        if category_a_functions:
+            category_a_names = ", ".join([f"`{f['function_name']}`" for f in category_a_functions])
+            category_a_context = (
+                f"**Boilerplate & Runtime Stubs (Category A): {boilerplate_count} functions**\n\n"
+                f"The following functions are compiler-generated boilerplate, CRT startup stubs, or standard "
+                f"library wrappers and were excluded from vulnerability analysis:\n\n"
+                f"{category_a_names}\n"
             )
 
         prompt = f"""
@@ -204,12 +225,17 @@ Below is the context retrieved from secure coding databases (SEI CERT C / CWE) a
 - **Verdict**: {verdict}
 - **Risk Level**: {risk_level}
 - **Total Functions Evaluated**: {total_functions}
+- **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}
+- **Actual Code Functions Scanned**: {actual_count}
 
 ### SECURITY STANDARDS CONTEXT:
 {reference_context}
 
-### FUNCTIONS AUDIT CONTEXT:
-{functions_context}
+### CATEGORY B — ACTUAL CODE FUNCTIONS AUDIT:
+{category_b_context}
+
+### CATEGORY A — BOILERPLATE & RUNTIME STUBS:
+{category_a_context}
 
 Please draft a gorgeous Markdown document including:
 1. **Title**: '# Sentinel AI Security Audit Report'
@@ -219,21 +245,28 @@ Please draft a gorgeous Markdown document including:
    - **Verdict**: {verdict}
    - **Risk Level**: {risk_level}
    - **Total Functions Evaluated**: {total_functions}
+   - **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}
+   - **Actual Code Functions Scanned**: {actual_count}
 3. **Executive Summary**: Write a professional executive summary explaining the verdict and scope of the audit.
    - For 0 vulnerabilities found: explain that all function Control Flow Graphs (CFGs) were checked and conform to standard coding rules. No vulnerabilities were detected.
    - For cases with vulnerabilities (Yellow, Orange, Red tiers): explain the threat vectors found and the urgency of the remediation. Use the custom tier name ({color_tier}) and severity ({severity_level}) appropriately.
    - Do NOT use the big word "VULNERABLE" or "CLEAN" anywhere in the document, especially for headers or big verdicts. Instead, use "{verdict}" to describe the verdict.
-4. **Analysis Metrics**: Detail the static analysis parameters, total function count, and number of flagged functions. Do NOT show or include any model confidence levels or percentages.
-5. **Detailed Findings Section**:
-   - For 0 vulnerabilities found: state "No security flaws or rule violations were flagged." List the checked functions as safe.
-   - For cases with vulnerabilities: provide a detailed breakdown for each flagged function, containing:
+4. **Category B — Actual Code Functions (Detailed Analysis)**: This section must appear IMMEDIATELY after the executive summary.
+   - List EVERY Category B function.
+   - For each SAFE function: provide a concise 2-3 line security validation summary explaining that its CFG patterns conform to secure baselines.
+   - For each VULNERABLE function: provide a detailed breakdown containing:
      - Technical breakdown of the exploit vector (how the instructions represent buffer overflows or out-of-bounds writes).
      - The SEI CERT C coding rule violated.
      - **Remediation & Secure Code Fix**: Provide a clear, correct rewrite of the vulnerable concept in C/C++ showing secure library usage (e.g. using `strncat` or boundary bounds checks).
-     - Do NOT display or print any confidence levels or model confidence percentages for the findings.
+5. **Category A — Boilerplate & Runtime Stubs**: Place this section at the VERY BOTTOM of the report.
+   - Include a single short explanation header explaining what these functions are.
+   - List only their names in a compact format.
 6. **General Mitigations**: Highlight best practices for compilation (canaries, DEP, ASLR, Control Flow Integrity) and security testing.
 
-Use strong markdown syntax, code snippets, headers, and bullet points. Make it read like a premium security consultancy report.
+CRITICAL INSTRUCTIONS:
+- Do NOT display or print any confidence levels, model confidence percentages, or probability scores ANYWHERE in the report.
+- Do NOT use the big word "VULNERABLE" or "CLEAN" as standalone headers or verdicts.
+- Use strong markdown syntax, code snippets, headers, and bullet points. Make it read like a premium security consultancy report.
 """
 
         logger.info("Invoking Gemini to compile security report...")

@@ -279,7 +279,8 @@ class VulnerabilityPredictor:
             json_filepath: Path to the generated cfg_features.json file.
 
         Returns:
-            dict with verdict, confidence, top_features (list of analyzed functions), and flagged_functions list.
+            dict with verdict, category_a_functions (boilerplate), category_b_functions (actual code),
+            flagged_functions list, and count metrics. No top-level confidence.
         """
         with self._lock:
             if not self._is_loaded:
@@ -294,19 +295,23 @@ class VulnerabilityPredictor:
 
             if not functions_list:
                 return {
-                "prediction": "Safe",
-                "label": 0,
-                "confidence": 1.0,
-                "top_features": [],
-                "flagged_functions": [],
-                "decision_source": "gnn"
-            }
+                    "prediction": "Safe",
+                    "label": 0,
+                    "top_features": [],
+                    "flagged_functions": [],
+                    "category_a_functions": [],
+                    "category_b_functions": [],
+                    "total_functions": 0,
+                    "boilerplate_count": 0,
+                    "actual_count": 0,
+                    "decision_source": "gnn"
+                }
 
             analyzed_functions = []
             flagged_functions = []
+            category_a_functions = []
+            category_b_functions = []
             overall_vulnerable = False
-            max_vuln_confidence = 0.0
-            max_safe_confidence = 0.0
 
             w2v = self._w2v_model
             vector_size = w2v.vector_size
@@ -354,55 +359,63 @@ class VulnerabilityPredictor:
                 else:
                     edge_index = torch.empty((2, 0), dtype=torch.long).to(self.device)
 
-                # Check if symbol is compiler boilerplate
+                # Check if symbol is compiler boilerplate — Category A
                 if is_boilerplate_or_lib(fname) or is_trivial_stub(fname, nodes):
-                    vuln_prob = 0.0
-                    safe_prob = 1.0
-                    is_vuln = False
-                    confidence = 1.0
+                    category_a_functions.append({"function_name": fname})
                     func_decision_source = "boilerplate"
-                else:
-                    # Run GNN on every function regardless of size
-                    batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
-                    probs_list = []
-                    with torch.no_grad():
-                        for fold_name, model in self._gnn_models.items():
-                            out = model(x, edge_index, batch)
-                            probs = torch.softmax(out, dim=1)[0]
-                            probs_list.append(probs)
+                    is_vuln = False
 
-                    avg_probs = torch.stack(probs_list).mean(dim=0)
-                    vuln_prob = float(avg_probs[1])
-                    safe_prob = float(avg_probs[0])
-                    is_vuln = vuln_prob > 0.5
-                    confidence = vuln_prob if is_vuln else safe_prob
-                    func_decision_source = "gnn"
+                    func_info = {
+                        "function_name": fname,
+                        "is_vulnerable": False,
+                        "nodes_count": len(nodes),
+                        "edges_count": len(edges),
+                        "decision_source": func_decision_source,
+                        "oov_rate": round(oov_rate, 4)
+                    }
+                    analyzed_functions.append(func_info)
+                    continue
 
-                    # One-way heuristic rescue: can only override Vulnerable → Safe
-                    # If GNN flags as Vulnerable, but the function uses safe
-                    # API calls (strncpy, snprintf, etc.) and has zero unsafe
-                    # API calls (strcpy, gets, etc.), rescue it to Safe.
-                    if is_vuln:
-                        has_unsafe = False
-                        has_safe = False
-                        for node in nodes:
-                            for instr in node["instructions"]:
-                                instr_lower = instr.lower()
-                                for api in UNSAFE_APIS:
-                                    if _word_boundary_match(api, instr_lower):
-                                        has_unsafe = True
-                                        break
-                                for api in SAFE_APIS:
-                                    if _word_boundary_match(api, instr_lower):
-                                        has_safe = True
-                                        break
+                # --- Category B: Actual Code Functions ---
+                # Run GNN on every function regardless of size
+                batch = torch.zeros(x.size(0), dtype=torch.long).to(self.device)
+                probs_list = []
+                with torch.no_grad():
+                    for fold_name, model in self._gnn_models.items():
+                        out = model(x, edge_index, batch)
+                        probs = torch.softmax(out, dim=1)[0]
+                        probs_list.append(probs)
 
-                        if has_safe and not has_unsafe:
-                            vuln_prob = 0.15
-                            safe_prob = 0.85
-                            is_vuln = False
-                            confidence = safe_prob
-                            func_decision_source = "rescue"
+                avg_probs = torch.stack(probs_list).mean(dim=0)
+                vuln_prob = float(avg_probs[1])
+                safe_prob = float(avg_probs[0])
+                is_vuln = vuln_prob > 0.5
+                func_decision_source = "gnn"
+
+                # One-way heuristic rescue: can only override Vulnerable → Safe
+                # If GNN flags as Vulnerable, but the function uses safe
+                # API calls (strncpy, snprintf, etc.) and has zero unsafe
+                # API calls (strcpy, gets, etc.), rescue it to Safe.
+                if is_vuln:
+                    has_unsafe = False
+                    has_safe = False
+                    for node in nodes:
+                        for instr in node["instructions"]:
+                            instr_lower = instr.lower()
+                            for api in UNSAFE_APIS:
+                                if _word_boundary_match(api, instr_lower):
+                                    has_unsafe = True
+                                    break
+                            for api in SAFE_APIS:
+                                if _word_boundary_match(api, instr_lower):
+                                    has_safe = True
+                                    break
+
+                    if has_safe and not has_unsafe:
+                        vuln_prob = 0.15
+                        safe_prob = 0.85
+                        is_vuln = False
+                        func_decision_source = "rescue"
 
                 # Formulate decompiled / disassembled preview for RAG context
                 decompiled_lines = []
@@ -413,7 +426,6 @@ class VulnerabilityPredictor:
 
                 func_info = {
                     "function_name": fname,
-                    "confidence": round(confidence, 4),
                     "is_vulnerable": is_vuln,
                     "nodes_count": len(nodes),
                     "edges_count": len(edges),
@@ -424,26 +436,45 @@ class VulnerabilityPredictor:
 
                 if is_vuln:
                     overall_vulnerable = True
-                    if vuln_prob > max_vuln_confidence:
-                        max_vuln_confidence = vuln_prob
 
-                    explanation = f"GNN model classified this function as vulnerable with {confidence:.1%} confidence."
+                    explanation = f"GNN model classified this function as vulnerable."
 
-                    flagged_functions.append({
+                    flagged_entry = {
                         "function_name": fname,
-                        "confidence": round(vuln_prob, 4),
                         "decompiled_code": "\n".join(decompiled_lines),
                         "cwe_id": detect_cwe_from_code(decompiled_lines),
                         "brief_explanation": explanation,
                         "decision_source": func_decision_source
+                    }
+                    flagged_functions.append(flagged_entry)
+
+                    # Category B entry for vulnerable function
+                    category_b_functions.append({
+                        "function_name": fname,
+                        "is_vulnerable": True,
+                        "decision_source": func_decision_source,
+                        "explanation": explanation,
+                        "cwe_id": detect_cwe_from_code(decompiled_lines),
+                        "decompiled_code": "\n".join(decompiled_lines)
                     })
                 else:
-                    if safe_prob > max_safe_confidence:
-                        max_safe_confidence = safe_prob
+                    # Category B entry for safe function — inline 2-3 line summary
+                    safe_explanation = (
+                        f"This function's control flow graph was analyzed by the GNN model and classified as safe. "
+                        f"Its graph structure matches standard secure coding patterns with no calls to known unsafe "
+                        f"API functions (strcpy, gets, sprintf, etc.)."
+                    )
+                    category_b_functions.append({
+                        "function_name": fname,
+                        "is_vulnerable": False,
+                        "decision_source": func_decision_source,
+                        "explanation": safe_explanation,
+                        "cwe_id": None,
+                        "decompiled_code": None
+                    })
 
             overall_prediction = "Vulnerable" if overall_vulnerable else "Safe"
             overall_label = 1 if overall_vulnerable else 0
-            overall_confidence = max_vuln_confidence if overall_vulnerable else max_safe_confidence
 
             # Determine overall decision source
             decision_sources = [af["decision_source"] for af in analyzed_functions if af["decision_source"] != "boilerplate"]
@@ -452,22 +483,34 @@ class VulnerabilityPredictor:
             else:
                 overall_decision_source = "gnn"
 
-            # Format top_features to display analyzed functions in the frontend dashboard
+            # Count metrics
+            total_functions = len(category_a_functions) + len(category_b_functions)
+            boilerplate_count = len(category_a_functions)
+            actual_count = len(category_b_functions)
+
+            # Format top_features for backward compatibility
             top_features = []
-            for af in sorted(analyzed_functions, key=lambda x: x["confidence"], reverse=True):
+            for af in sorted(
+                [a for a in analyzed_functions if a["decision_source"] != "boilerplate"],
+                key=lambda x: x["is_vulnerable"],
+                reverse=True
+            ):
                 status = "Vulnerable" if af["is_vulnerable"] else "Safe"
                 top_features.append({
                     "feature": f"{af['function_name']} ({status} - {af['decision_source']})",
-                    "importance": af["confidence"],
                     "tfidf_weight": af["nodes_count"]
                 })
 
             return {
                 "prediction": overall_prediction,
                 "label": overall_label,
-                "confidence": round(overall_confidence, 4),
                 "top_features": top_features,
                 "flagged_functions": flagged_functions,
+                "category_a_functions": category_a_functions,
+                "category_b_functions": category_b_functions,
+                "total_functions": total_functions,
+                "boilerplate_count": boilerplate_count,
+                "actual_count": actual_count,
                 "decision_source": overall_decision_source
             }
 

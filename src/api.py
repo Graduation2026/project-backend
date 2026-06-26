@@ -471,38 +471,38 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GNN prediction failed: {str(e)}")
 
-    # Generate context-enriched Vulnerability Report and Render PDF
+    # Generate context-enriched Vulnerability Report and Render PDF (always invoked)
     report_markdown = ""
     pdf_url = ""
-    if len(result["flagged_functions"]) > 0:
-        try:
-            logger.info("Generating context-enriched security report...")
-            report_markdown = rag_service.generate_vulnerability_report(
-                flagged_functions=result["flagged_functions"],
-                filename=file.filename,
-                sha256_hash=sha256_hash,
-                total_functions=len(result["top_features"])
-            )
-            
-            pdf_filename = f"report_{sha256_hash}.pdf"
-            pdf_path = reports_static_dir / pdf_filename
-            
-            logger.info(f"Rendering report PDF to {pdf_path}...")
-            convert_markdown_to_pdf(report_markdown, pdf_path)
-            pdf_url = f"/reports/{pdf_filename}"
-        except Exception as e:
-            logger.error(f"Report or PDF generation failed: {str(e)}")
-            report_markdown = f"# Analysis Completed\n\nFailed to generate security report: {str(e)}"
-            pdf_url = ""
-    else:
-        logger.info("RAG audit status: Bypassed (File scored as Clean)")
-        report_markdown = "No vulnerabilities detected. RAG audit bypassed."
+    try:
+        logger.info("Generating context-enriched security report...")
+        report_markdown = rag_service.generate_vulnerability_report(
+            category_a_functions=result["category_a_functions"],
+            category_b_functions=result["category_b_functions"],
+            flagged_functions=result["flagged_functions"],
+            filename=file.filename,
+            sha256_hash=sha256_hash,
+            total_functions=result["total_functions"],
+            actual_count=result["actual_count"],
+            boilerplate_count=result["boilerplate_count"],
+        )
+        
+        pdf_filename = f"report_{sha256_hash}.pdf"
+        pdf_path = reports_static_dir / pdf_filename
+        
+        logger.info(f"Rendering report PDF to {pdf_path}...")
+        convert_markdown_to_pdf(report_markdown, pdf_path)
+        pdf_url = f"/reports/{pdf_filename}"
+    except Exception as e:
+        logger.error(f"Report or PDF generation failed: {str(e)}")
+        report_markdown = f"# Analysis Completed\n\nFailed to generate security report: {str(e)}"
         pdf_url = ""
 
-    # Build response payload combining Sentinel dashboard compatibility + AI report data
+    # Build response payload with category-based structure (no confidence)
     total_time = time.time() - total_start
-    verdict = "SAFE" if result["label"] == 0 else "VULNERABLE"
-    risk_score = float(result["confidence"] * 100 if verdict == "VULNERABLE" else (1 - result["confidence"]) * 100)
+    flagged_count = len(result["flagged_functions"])
+    actual_count = result["actual_count"]
+    verdict_str = f"{flagged_count} out of {actual_count} functions were vulnerable" if flagged_count > 0 else f"0 out of {actual_count} functions were vulnerable"
 
     response = {
         "status": "success",
@@ -510,12 +510,15 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
         "sha256": sha256_hash,
         "prediction": result["prediction"],
         "label": result["label"],
-        "confidence": result["confidence"],
+        "verdict": verdict_str,
         "top_features": result["top_features"],
-        "verdict": verdict,
-        "risk_score": round(risk_score, 1),
-        "flagged_functions_count": len(result["flagged_functions"]),
+        "flagged_functions_count": flagged_count,
         "flagged_functions": result["flagged_functions"],
+        "category_a_functions": result["category_a_functions"],
+        "category_b_functions": result["category_b_functions"],
+        "total_functions": result["total_functions"],
+        "boilerplate_count": result["boilerplate_count"],
+        "actual_count": actual_count,
         "report_markdown": report_markdown,
         "pdf_url": pdf_url,
         "timing": {
@@ -527,8 +530,8 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
     }
 
     logger.info(
-        f"RESULT: {file.filename} -> {verdict} "
-        f"({result['confidence']:.2%}) in {total_time:.1f}s"
+        f"RESULT: {file.filename} -> {result['prediction']} | "
+        f"{flagged_count}/{actual_count} vulnerable | {total_time:.1f}s"
     )
 
     # Cleanup temp files
