@@ -465,8 +465,7 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
         result = predictor.predict(features_file)
         ml_time = time.time() - ml_start
         logger.info(
-            f"GNN Prediction completed in {ml_time:.3f}s | Result: {result['prediction']} "
-            f"(confidence: {result['confidence']:.2%})"
+            f"GNN Prediction completed in {ml_time:.3f}s | Result: {result['prediction']}"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GNN prediction failed: {str(e)}")

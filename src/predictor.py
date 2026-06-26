@@ -459,11 +459,18 @@ class VulnerabilityPredictor:
                     })
                 else:
                     # Category B entry for safe function — inline 2-3 line summary
-                    safe_explanation = (
-                        f"This function's control flow graph was analyzed by the GNN model and classified as safe. "
-                        f"Its graph structure matches standard secure coding patterns with no calls to known unsafe "
-                        f"API functions (strcpy, gets, sprintf, etc.)."
-                    )
+                    if func_decision_source == "rescue":
+                        safe_explanation = (
+                            f"The GNN model initially flagged this function, but heuristic analysis determined it uses "
+                            f"safe API alternatives (e.g., fgets, strncpy, snprintf) with no calls to known unsafe functions. "
+                            f"The verdict was overridden to Safe."
+                        )
+                    else:
+                        safe_explanation = (
+                            f"This function's control flow graph was analyzed by the GNN model and classified as safe. "
+                            f"Its graph structure matches standard secure coding patterns with no calls to known unsafe "
+                            f"API functions (strcpy, gets, sprintf, etc.)."
+                        )
                     category_b_functions.append({
                         "function_name": fname,
                         "is_vulnerable": False,
