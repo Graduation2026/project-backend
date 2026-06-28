@@ -59,6 +59,7 @@ class ReportGenerationService:
             self.llm = ChatGoogleGenerativeAI(
                 model="gemini-2.5-flash",
                 temperature=0.2,
+                max_output_tokens=4096,
                 google_api_key=self.api_key
             )
 
@@ -114,6 +115,80 @@ class ReportGenerationService:
         else:
             logger.warning("No markdown files found in knowledge_base/. Database is empty.")
 
+    def _generate_safe_template_report(
+        self,
+        category_a_functions: list[dict],
+        category_b_functions: list[dict],
+        filename: str,
+        sha256_hash: str,
+        total_functions: int,
+        actual_count: int,
+        boilerplate_count: int,
+    ) -> str:
+        """Generate a clean, template-based report for files with 0 vulnerabilities.
+        Skips the LLM entirely — saves API cost and guarantees consistent structure."""
+        report_lines = [
+            "# Sentinel AI Security Audit Report",
+            "",
+            "## Audit Metadata",
+            f"- **Filename**: {filename}",
+            f"- **SHA-256 Checksum**: {sha256_hash}",
+            f"- **Verdict**: 0 vulnerabilities found out of {actual_count} actual code functions",
+            f"- **Risk Level**: LOW (Green)",
+            f"- **Total Functions Evaluated**: {total_functions}",
+            f"- **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}",
+            f"- **Actual Code Functions Scanned**: {actual_count}",
+            "",
+            "## Executive Summary",
+            "",
+            f"Sentinel AI performed a comprehensive security audit on **{filename}** using GNN-based "
+            f"Control Flow Graph (CFG) analysis. A total of {total_functions} functions were extracted "
+            f"via Ghidra reverse engineering, of which {boilerplate_count} were identified as compiler-generated "
+            f"boilerplate or runtime stubs and excluded from analysis.",
+            "",
+            f"The remaining {actual_count} actual code functions were analyzed by the GATv2 Graph Neural Network. "
+            f"All function CFGs conform to standard secure coding baselines. No vulnerability patterns were detected.",
+            "",
+            "## Category B - Actual Code Functions",
+            "",
+        ]
+
+        for func in category_b_functions:
+            fname = func["function_name"]
+            source = func.get("decision_source", "gnn")
+            if source == "rescue":
+                report_lines.append(f"- `{fname}` - Safe (heuristic rescue: uses safe API alternatives, no unsafe calls detected)")
+            else:
+                report_lines.append(f"- `{fname}` - Safe (CFG conforms to secure baselines)")
+
+        report_lines.extend([
+            "",
+            "## General Mitigations",
+            "",
+            "Even when no vulnerabilities are detected, the following compiler hardening flags are recommended for production builds:",
+            "",
+            "- **Stack Canaries** (`-fstack-protector-strong`): Detects stack buffer overflows at runtime",
+            "- **DEP/NX** (`-Wl,-z,noexecstack`): Prevents execution of code on the stack",
+            "- **ASLR/PIE** (`-fPIE -pie`): Randomizes memory layout to prevent ROP attacks",
+            "- **Full RELRO** (`-Wl,-z,relro,-z,now`): Protects the Global Offset Table from overwrites",
+            "- **FORTIFY_SOURCE** (`-D_FORTIFY_SOURCE=2`): Replaces unsafe libc calls with bounds-checked variants",
+            "",
+        ])
+
+        if category_a_functions:
+            cat_a_names = ", ".join([f"`{f['function_name']}`" for f in category_a_functions])
+            report_lines.extend([
+                "## Category A - Boilerplate & Runtime Stubs",
+                "",
+                f"The following {boilerplate_count} functions are compiler-generated boilerplate, CRT startup "
+                f"stubs, or standard library wrappers and were excluded from vulnerability analysis:",
+                "",
+                cat_a_names,
+                "",
+            ])
+
+        return "\n".join(report_lines)
+
     def generate_vulnerability_report(
         self,
         category_a_functions: list[dict],
@@ -126,9 +201,10 @@ class ReportGenerationService:
         boilerplate_count: int = 0,
     ) -> str:
         """
-        Retrieves reference standards from the knowledge base and generates a comprehensive Markdown
-        security report for the scanned file. Always invoked (both safe and vulnerable verdicts).
-        Groups functions into Category B (actual code, detailed) and Category A (boilerplate, names only).
+        Generates a concise, actionable Markdown security report.
+        For safe files (0 vulnerabilities): uses a static template (no LLM call).
+        For vulnerable files: retrieves reference standards from knowledge base and
+        invokes Gemini with a tightly constrained prompt to prevent word vomit.
         """
         self.initialize()
 
@@ -136,12 +212,16 @@ class ReportGenerationService:
         is_vulnerable = flagged_count > 0
         percentage = (flagged_count / actual_count * 100) if actual_count > 0 else 0.0
 
-        if percentage == 0.0:
-            verdict = f"0 vulnerabilities found out of {actual_count} actual code functions"
-            risk_level = "LOW (Green)"
-            color_tier = "Green"
-            severity_level = "LOW"
-        elif percentage <= 25.0:
+        # --- Safe file: use template-based report, skip LLM entirely ---
+        if not is_vulnerable:
+            logger.info("No vulnerabilities detected — generating template-based safe report (no LLM call).")
+            return self._generate_safe_template_report(
+                category_a_functions, category_b_functions,
+                filename, sha256_hash, total_functions, actual_count, boilerplate_count
+            )
+
+        # --- Vulnerable file: determine severity tier ---
+        if percentage <= 25.0:
             verdict = f"{flagged_count} vulnerabilities found out of {actual_count} actual code functions"
             risk_level = "MEDIUM (Yellow)"
             color_tier = "Yellow"
@@ -157,117 +237,78 @@ class ReportGenerationService:
             color_tier = "Red"
             severity_level = "CRITICAL"
 
-        # Retrieve reference guidelines from Chroma DB
+        # Retrieve reference guidelines from Chroma DB (increased k for richer context)
         retrieved_docs = []
-        if is_vulnerable:
-            # Sort flagged functions by CWE and limit detailed analysis to top 10 critical ones
-            top_critical = flagged_functions[:10]
-            unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in top_critical)
-            for cwe in unique_cwes:
-                query = f"CWE memory corruption {cwe} buffer overflow out of bounds write"
-                docs = self.vector_store.similarity_search(query, k=1)
-                if docs:
-                    retrieved_docs.append(docs[0].page_content)
-        else:
-            # For safe targets, fetch a few general CERT C guidelines to display compliance standards
-            query = "CWE memory safety rules buffer overflow stack protection secure coding"
-            docs = self.vector_store.similarity_search(query, k=2)
+        unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in flagged_functions)
+        for cwe in unique_cwes:
+            query = f"{cwe} vulnerability exploit mitigation CERT C secure coding"
+            docs = self.vector_store.similarity_search(query, k=3)
             for d in docs:
                 retrieved_docs.append(d.page_content)
 
         reference_context = "\n\n".join(set(retrieved_docs))
 
-        # --- Format Category B (Actual Code Functions) context ---
-        category_b_context = f"**Actual Code Functions Analyzed (Category B): {actual_count}**\n\n"
-        for idx, func in enumerate(category_b_functions):
+        # --- Format Category B context (concise) ---
+        category_b_context = ""
+        for func in category_b_functions:
             fname = func["function_name"]
             if func["is_vulnerable"]:
-                # Find matching flagged function for full details
                 flagged_match = next((f for f in flagged_functions if f["function_name"] == fname), None)
                 cwe_id = func.get("cwe_id", "CWE-119")
-                category_b_context += (
-                    f"### Function {idx + 1}: `{fname}` — ⚠️ VULNERABLE\n"
-                    f"- **Status:** Vulnerable\n"
-                    f"- **Identified Threat:** {cwe_id} (Memory Safety / Buffer Overflow)\n"
-                    f"- **Model Explanation:** {func.get('explanation', 'GNN model classified this function as vulnerable.')}\n"
-                )
+                category_b_context += f"- `{fname}` | FLAGGED | {cwe_id}\n"
                 if flagged_match and flagged_match.get("decompiled_code"):
-                    category_b_context += (
-                        f"- **Disassembled CFG Code Blocks:**\n"
-                        f"```\n{flagged_match['decompiled_code']}\n```\n\n"
-                    )
+                    # Limit decompiled code to first 15 lines to prevent prompt bloat
+                    code_lines = flagged_match['decompiled_code'].split('\n')[:15]
+                    category_b_context += f"```\n{'chr(10)'.join(code_lines)}\n```\n"
             else:
-                category_b_context += (
-                    f"### Function {idx + 1}: `{fname}` — ✅ Safe\n"
-                    f"- **Status:** Safe\n"
-                    f"- **Security Validation:** {func.get('explanation', 'No unsafe patterns detected.')}\n\n"
-                )
+                category_b_context += f"- `{fname}` | Safe\n"
 
-        # --- Format Category A (Boilerplate & Runtime Stubs) context ---
-        category_a_context = ""
+        # --- Format Category A (names only, comma-separated) ---
+        category_a_names = ""
         if category_a_functions:
             category_a_names = ", ".join([f"`{f['function_name']}`" for f in category_a_functions])
-            category_a_context = (
-                f"**Boilerplate & Runtime Stubs (Category A): {boilerplate_count} functions**\n\n"
-                f"The following functions are compiler-generated boilerplate, CRT startup stubs, or standard "
-                f"library wrappers and were excluded from vulnerability analysis:\n\n"
-                f"{category_a_names}\n"
-            )
 
-        prompt = f"""
-You are an expert security engineer and binary auditor. You will write a comprehensive, professional, and visually stunning unified vulnerability assessment report.
+        prompt = f"""You are a concise, expert security engineer writing a binary vulnerability audit report.
 
-Below is the context retrieved from secure coding databases (SEI CERT C / CWE) and details on the functions analyzed by our GNN compiler wrapper.
+SECURITY METADATA:
+- Filename: {filename}
+- SHA-256: {sha256_hash}
+- Verdict: {verdict}
+- Risk Level: {risk_level} ({color_tier} tier, {severity_level} severity)
+- Total Functions: {total_functions} | Boilerplate Filtered: {boilerplate_count} | Actual Scanned: {actual_count}
 
-### SECURITY METADATA:
-- **Filename**: {filename}
-- **SHA-256 Checksum**: {sha256_hash}
-- **Verdict**: {verdict}
-- **Risk Level**: {risk_level}
-- **Total Functions Evaluated**: {total_functions}
-- **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}
-- **Actual Code Functions Scanned**: {actual_count}
-
-### SECURITY STANDARDS CONTEXT:
+REFERENCE STANDARDS:
 {reference_context}
 
-### CATEGORY B — ACTUAL CODE FUNCTIONS AUDIT:
+FUNCTION AUDIT DATA:
 {category_b_context}
 
-### CATEGORY A — BOILERPLATE & RUNTIME STUBS:
-{category_a_context}
+BOILERPLATE NAMES:
+{category_a_names}
 
-Please draft a gorgeous Markdown document including:
-1. **Title**: '# Sentinel AI Security Audit Report'
-2. **Audit Metadata Labeled List**: Display the security metadata cleanly using a bolded list (do NOT use markdown tables to ensure clean PDF compiling compatibility):
-   - **Filename**: {filename}
-   - **SHA-256 Checksum**: {sha256_hash}
-   - **Verdict**: {verdict}
-   - **Risk Level**: {risk_level}
-   - **Total Functions Evaluated**: {total_functions}
-   - **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}
-   - **Actual Code Functions Scanned**: {actual_count}
-3. **Executive Summary**: Write a professional executive summary explaining the verdict and scope of the audit.
-   - For 0 vulnerabilities found: explain that all function Control Flow Graphs (CFGs) were checked and conform to standard coding rules. No vulnerabilities were detected.
-   - For cases with vulnerabilities (Yellow, Orange, Red tiers): explain the threat vectors found and the urgency of the remediation. Use the custom tier name ({color_tier}) and severity ({severity_level}) appropriately.
-   - Do NOT use the big word "VULNERABLE" or "CLEAN" anywhere in the document, especially for headers or big verdicts. Instead, use "{verdict}" to describe the verdict.
-4. **Category B — Actual Code Functions (Detailed Analysis)**: This section must appear IMMEDIATELY after the executive summary.
-   - List EVERY Category B function.
-   - For each SAFE function: provide a concise 2-3 line security validation summary explaining that its CFG patterns conform to secure baselines.
-   - For each VULNERABLE function: provide a detailed breakdown containing:
-     - Technical breakdown of the exploit vector (how the instructions represent buffer overflows or out-of-bounds writes).
-     - The SEI CERT C coding rule violated.
-     - **Remediation & Secure Code Fix**: Provide a clear, correct rewrite of the vulnerable concept in C/C++ showing secure library usage (e.g. using `strncat` or boundary bounds checks).
-5. **Category A — Boilerplate & Runtime Stubs**: Place this section at the VERY BOTTOM of the report.
-   - Include a single short explanation header explaining what these functions are.
-   - List only their names in a compact format.
-6. **General Mitigations**: Highlight best practices for compilation (canaries, DEP, ASLR, Control Flow Integrity) and security testing.
+Write a Markdown report with EXACTLY this structure:
 
-CRITICAL INSTRUCTIONS:
-- Do NOT display or print any confidence levels, model confidence percentages, or probability scores ANYWHERE in the report.
-- Do NOT use the big word "VULNERABLE" or "CLEAN" as standalone headers or verdicts.
-- Use strong markdown syntax, code snippets, headers, and bullet points. Make it read like a premium security consultancy report.
-"""
+1. `# Sentinel AI Security Audit Report`
+2. `## Audit Metadata` — Bolded list (NOT a table) with: Filename, SHA-256, Verdict, Risk Level, Total Functions, Boilerplate Filtered, Actual Scanned.
+3. `## Executive Summary` — 3-5 sentences max. State the verdict, threat severity ({color_tier}/{severity_level}), and remediation urgency. No filler.
+4. `## Category B - Actual Code Functions` — For each function:
+   - SAFE functions: ONE line only. Format: `- function_name - Safe. CFG conforms to secure baselines.`
+   - FLAGGED functions: Maximum 5 bullet points:
+     1. Threat ID (CWE number and name)
+     2. One-line root cause
+     3. CERT C rule violated
+     4. 3-5 line remediation code snippet in a code block
+     5. One-line fix summary
+5. `## General Mitigations` — 5 bullet points max covering compiler hardening (canaries, DEP, ASLR, RELRO, FORTIFY_SOURCE).
+6. `## Category A - Boilerplate & Runtime Stubs` — One explanation sentence, then the comma-separated names list.
+
+CRITICAL RULES:
+- Keep the ENTIRE report under 2,500 words.
+- Do NOT include confidence percentages or probability scores.
+- Do NOT use "VULNERABLE" or "CLEAN" as standalone headers.
+- Do NOT pad with general cybersecurity lectures. Be surgical and actionable.
+- Do NOT repeat information already stated in other sections.
+- Use the verdict "{verdict}" verbatim when referencing the outcome."""
 
         logger.info("Invoking Gemini to compile security report...")
         response = self._invoke_llm_with_retry(prompt)
@@ -289,7 +330,7 @@ CRITICAL INSTRUCTIONS:
             chat_history = []
 
         # Retrieve relevant CWE standards
-        docs = self.vector_store.similarity_search(query, k=2)
+        docs = self.vector_store.similarity_search(query, k=4)
         ref_context = "\n\n".join([d.page_content for d in docs])
 
         # Format history

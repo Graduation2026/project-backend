@@ -467,6 +467,17 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
         logger.info(
             f"GNN Prediction completed in {ml_time:.3f}s | Result: {result['prediction']}"
         )
+    except ValueError as e:
+        # Function cap exceeded (> 100 Category B functions) — reject gracefully
+        logger.warning(f"Analysis rejected: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Too many functions",
+                "message": str(e),
+                "suggestion": "Upload individual source files or smaller compilation units instead of large monolithic binaries.",
+            },
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GNN prediction failed: {str(e)}")
 

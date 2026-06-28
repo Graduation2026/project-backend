@@ -59,8 +59,11 @@ class VulnGNN(torch.nn.Module):
 
 
 # --- Boilerplate Symbol Blacklist ---
+# Master list of all known compiler-generated boilerplate functions, runtime stubs,
+# and CRT startup symbols. These are NOT user-defined code and must be excluded
+# from GNN vulnerability analysis to prevent false positives.
 BOILERPLATE_BLACKLIST = {
-    # MinGW/GCC CRT & Windows Startup
+    # ── MinGW/GCC CRT & Windows Startup ──
     "mainCRTStartup", "WinMainCRTStartup", "__mingw_CRTStartup", "pre_c_init", "pre_cpp_init", "_pre_cpp_init",
     "_get_output_format", "__deregister_frame_info", "__register_frame_info", "_register_frame_info", "_deregister_frame_info",
     ".weak.__deregister_frame_info.hmod_libgcc", ".weak.__register_frame_info.hmod_libgcc",
@@ -68,10 +71,14 @@ BOILERPLATE_BLACKLIST = {
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
     "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
-    # Linux ELF Startup
-    "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
-    "__libc_csu_fini", "_dl_relocate_static_pie",
-    # MSVC CRT & Windows Startup
+    "__do_global_dtors", "__do_global_ctors", "__main", "_pei386_runtime_relocator",
+    "__mingw_init_ehandler", "__mingw_oldexcpt_handler", "__mingw_SEH_error_handler",
+    "__mingw_prepare_except_for_msvc", "__mingw_setusermatherr",
+    # ── Linux ELF Startup ──
+    "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init",
+    "__libc_csu_fini", "_dl_relocate_static_pie", "__libc_start_main",
+    "_init", "_fini", "__x86.get_pc_thunk.bx", "__x86.get_pc_thunk.ax",
+    # ── MSVC CRT & Windows Startup ──
     "__scrt_common_main_seh", "_mainCRTStartup", "_wmainCRTStartup", "_WinMainCRTStartup",
     "_DllMainCRTStartup", "__security_init_cookie", "__security_check_cookie",
     "__report_gsfailure", "__local_stdio_printf_options", "__local_stdio_scanf_options",
@@ -87,6 +94,44 @@ BOILERPLATE_BLACKLIST = {
     "__vcrt_thread_attach", "__vcrt_thread_detach", "__telemetry_main_invoke_trigger",
     "__telemetry_main_return_trigger", "_CRT_INIT", "_DllMain", "DllMain", "_CRT_INIT@12",
     "__dyn_tls_init", "__dyn_tls_dtor",
+    # ── MSVC SEH (Structured Exception Handling) ──
+    "_except_handler3", "_except_handler4", "__C_specific_handler",
+    "__SEH_prolog", "__SEH_epilog", "__SEH_prolog4", "__SEH_epilog4",
+    "_EH_prolog", "_EH_epilog", "_EH_prolog3", "_EH_epilog3",
+    # ── MSVC C++ Exception Handling ──
+    "_CxxFrameHandler3", "_CxxFrameHandler4", "__CxxFrameHandler",
+    "_CxxThrowException", "__CxxCallUnwindDtor", "__CxxCallUnwindDelDtor",
+    "__CxxCallUnwindVecDtor", "__CxxDetectRethrow",
+    # ── MSVC Guard/Security ──
+    "__GSHandlerCheck", "__GSHandlerCheck_SEH", "__GSHandlerCheck_EH4",
+    "_guard_dispatch_icall", "_guard_check_icall", "__castguard_check_failure",
+    "_guard_dispatch_icall_fptr", "_guard_xfg_dispatch_icall_fptr",
+    # ── MSVC Telemetry & Init ──
+    "__scrt_uninitialize_crt", "__scrt_exe_initialize_mta",
+    "__acrt_initialize", "__acrt_uninitialize", "__acrt_thread_attach", "__acrt_thread_detach",
+    # ── C++ ABI / Exception / RTTI ──
+    "__cxa_atexit", "__cxa_finalize", "__cxa_guard_acquire", "__cxa_guard_release",
+    "__cxa_guard_abort", "__cxa_throw", "__cxa_begin_catch", "__cxa_end_catch",
+    "__cxa_rethrow", "__cxa_allocate_exception", "__cxa_free_exception",
+    "__cxa_pure_virtual", "__cxa_deleted_virtual", "__cxa_bad_cast", "__cxa_bad_typeid",
+    "__cxa_call_unexpected", "__cxa_call_terminate",
+    "__dynamic_cast", "__cxa_demangle",
+    # ── GCC/LLVM Unwind & Personality ──
+    "_Unwind_Resume", "_Unwind_RaiseException", "_Unwind_GetLanguageSpecificData",
+    "_Unwind_GetRegionStart", "_Unwind_GetIP", "_Unwind_SetIP",
+    "_Unwind_SetGR", "_Unwind_GetGR", "_Unwind_DeleteException",
+    "__gxx_personality_v0", "__gcc_personality_v0",
+    "__clang_call_terminate",
+    # ── Stack Protectors ──
+    "__stack_chk_fail", "__stack_chk_guard",
+    # ── LLVM/Clang Runtime ──
+    "__clang_call_terminate", "__cxx_global_var_init",
+    # ── Go Runtime (if analyzing Go binaries) ──
+    "runtime.morestack", "runtime.morestack_noctxt", "runtime.goexit",
+    "runtime.main", "runtime.init", "runtime.args",
+    # ── Rust Runtime (if analyzing Rust binaries) ──
+    "__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed",
+    "__rust_alloc_error_handler",
 }
 
 CPP_LIB_KEYWORDS = {
@@ -115,10 +160,12 @@ STANDARD_LIBC_IMPORTS = {
 }
 
 def is_boilerplate_or_lib(fname: str) -> bool:
-    # Check exact matches
+    """Determine if a function symbol is compiler boilerplate, runtime stub, or standard library code.
+    Returns True for any symbol that should be excluded from GNN vulnerability analysis."""
+    # Check exact matches against all known lists
     if fname in BOILERPLATE_BLACKLIST or fname == ".text" or fname in CPP_LIB_KEYWORDS or fname in STANDARD_LIBC_IMPORTS:
         return True
-    
+
     # Strip leading underscores and check exact lists
     fname_clean = fname.lstrip('_')
     if fname_clean in STANDARD_LIBC_IMPORTS or fname_clean in BOILERPLATE_BLACKLIST:
@@ -136,14 +183,38 @@ def is_boilerplate_or_lib(fname: str) -> bool:
     if fname.startswith("__stdio_common_") or "frame_info" in fname or "_hmod_libgcc" in fname:
         return True
 
+    # Sanitizer runtimes (ASan, UBSan, MSan, TSan)
+    if fname.startswith(("__asan_", "__ubsan_", "__msan_", "__tsan_", "__sanitizer_")):
+        return True
+
+    # IAT/PLT import stubs and thunks
+    if fname.startswith(("_imp__", "__imp_", "thunk_", "_thunk_", "jmp_")):
+        return True
+    if "@thunk" in fname:
+        return True
+
+    # LLVM/Clang specific runtime symbols
+    if fname.startswith(("__clang_", "__cxx_global_var_init")):
+        return True
+
+    # Rust runtime symbols
+    if fname.startswith("__rust_") or fname.startswith("core::panicking") or fname.startswith("std::rt::lang_start"):
+        return True
+
+    # Go runtime symbols
+    if fname.startswith("runtime.") or fname.startswith("runtime_"):
+        # But exclude user-defined functions that happen to start with 'runtime'
+        if not fname.startswith("runtime_user_"):
+            return True
+
     # Check C++ standard library substrings directly (demangled STL symbols)
     STL_SUBSTRINGS = {"_Tuple", "tuple", "unique_ptr", "_Head_base", "_M_construct", "_M_dispose", "~_Alloc_hider", "_M_head", "std::", "basic_string", "allocator", "_Alloc_hider"}
     if any(x in fname for x in STL_SUBSTRINGS):
         return True
 
     # Check prefixes/substrings for compiler and library boilerplate
-    # MSVC: __scrt_, __vcrt_, _RTC_, __local_stdio_
-    if fname.startswith("__scrt_") or fname.startswith("__vcrt_") or fname.startswith("__local_stdio_") or "_RTC_" in fname:
+    # MSVC: __scrt_, __vcrt_, __acrt_, _RTC_, __local_stdio_
+    if fname.startswith(("__scrt_", "__vcrt_", "__acrt_", "__local_stdio_")) or "_RTC_" in fname:
         return True
 
     # Exception handling/runtimes: C++ ABI (_cxa_), Unwind, personality routines
@@ -156,6 +227,14 @@ def is_boilerplate_or_lib(fname: str) -> bool:
 
     # Compiler intrinsics / builtins
     if fname.startswith("__builtin_"):
+        return True
+
+    # MSVC guard/security dispatch
+    if fname.startswith("_guard_") or "__GSHandler" in fname or "__castguard_" in fname:
+        return True
+
+    # MSVC C++ exception handlers
+    if "CxxFrameHandler" in fname or "CxxThrowException" in fname or "CxxCallUnwind" in fname:
         return True
 
     # General compiler / runtime prefixes
@@ -177,18 +256,47 @@ def _word_boundary_match(api_name: str, text: str) -> bool:
     return bool(re.search(r'(?:^|(?<=[^a-zA-Z0-9_]))' + re.escape(api_name) + r'(?=[^a-zA-Z0-9_]|$)', text))
 
 # API-to-CWE mapping for dynamic CWE assignment (replaces hardcoded CWE-119)
+# This is a first-pass signature-based labeling aid — it provides the CWE tag for
+# the report, NOT a detection mechanism. The GNN handles structural detection.
 CWE_MAPPING = {
+    # Stack buffer overflow (CWE-121)
     "strcpy": "CWE-121", "strcat": "CWE-121", "gets": "CWE-121",
-    "sprintf": "CWE-121", "scanf": "CWE-120",
-    "memcpy": "CWE-787", "memmove": "CWE-787",
-    "printf": "CWE-134",
+    "sprintf": "CWE-121", "vsprintf": "CWE-121",
+    # Classic buffer overflow / unchecked input (CWE-120)
+    "scanf": "CWE-120", "fscanf": "CWE-120", "sscanf": "CWE-120",
+    # Out-of-bounds write (CWE-787)
+    "memcpy": "CWE-787", "memmove": "CWE-787", "wmemcpy": "CWE-787",
+    # Format string vulnerability (CWE-134)
+    "printf": "CWE-134", "fprintf": "CWE-134", "syslog": "CWE-134",
+    # OS command injection (CWE-78)
     "system": "CWE-78", "popen": "CWE-78",
+    "execl": "CWE-78", "execv": "CWE-78", "execlp": "CWE-78", "execvp": "CWE-78",
+    # Use-after-free (CWE-416)
     "free": "CWE-416", "realloc": "CWE-416",
+    # Integer overflow leading to buffer overflow (CWE-190)
     "malloc": "CWE-190", "calloc": "CWE-190",
+    # Dangerous functions (CWE-242 / CWE-676)
+    "mktemp": "CWE-242", "tmpnam": "CWE-242",
+    "atoi": "CWE-190", "atol": "CWE-190",
+    # Path traversal (CWE-22)
+    "realpath": "CWE-22",
 }
 
-UNSAFE_APIS = {"strcpy", "gets", "strcat", "sprintf", "scanf", "system", "popen"}
-SAFE_APIS = {"strncpy", "fgets", "strncat", "snprintf", "sscanf", "memcpy_s", "memmove_s", "wprintf", "printf_s"}
+UNSAFE_APIS = {
+    "strcpy", "gets", "strcat", "sprintf", "scanf", "system", "popen",
+    "vsprintf", "fscanf", "sscanf", "mktemp", "tmpnam",
+    "execl", "execv", "execlp", "execvp",
+}
+SAFE_APIS = {
+    # Bounds-checked string operations
+    "fgets", "snprintf", "memcpy_s", "memmove_s", "printf_s",
+    # C11 Annex K safe variants
+    "strcpy_s", "strcat_s", "gets_s", "fprintf_s", "sprintf_s",
+    # BSD safe alternatives
+    "strlcpy", "strlcat",
+    # Safe format functions
+    "vsnprintf",
+}
 
 
 def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
@@ -202,16 +310,23 @@ def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
 
 
 def is_trivial_stub(fname: str, nodes: list) -> bool:
-    """Detect if a function is a trivial compiler-generated stub (starts with FUN_, <= 1 block, no calls)."""
+    """Detect if a function is a trivial compiler-generated stub.
+    Matches FUN_ prefixed symbols with <= 2 basic blocks and no outgoing calls."""
     if not fname.startswith("FUN_"):
         return False
     for node in nodes:
         for instr in node.get("instructions", []):
             if "CALL" in instr or "call" in instr:
                 return False
-    if len(nodes) <= 1:
+    if len(nodes) <= 2:
         return True
     return False
+
+
+# --- Hard Function Cap ---
+# If a binary contains more than this many Category B (actual code) functions,
+# the analysis is rejected entirely to prevent unbounded report sizes.
+MAX_CATEGORY_B_FUNCTIONS = 100
 
 
 class VulnerabilityPredictor:
@@ -494,6 +609,16 @@ class VulnerabilityPredictor:
             total_functions = len(category_a_functions) + len(category_b_functions)
             boilerplate_count = len(category_a_functions)
             actual_count = len(category_b_functions)
+
+            # Enforce hard cap: reject scanning if Category B exceeds limit
+            if actual_count > MAX_CATEGORY_B_FUNCTIONS:
+                raise ValueError(
+                    f"This binary contains {actual_count} actual code functions (Category B), "
+                    f"which exceeds the maximum limit of {MAX_CATEGORY_B_FUNCTIONS}. "
+                    f"Total functions extracted: {total_functions} "
+                    f"(Boilerplate filtered: {boilerplate_count}). "
+                    f"Please upload a smaller binary or individual compilation units."
+                )
 
             # Format top_features for backward compatibility
             top_features = []
