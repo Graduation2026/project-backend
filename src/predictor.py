@@ -71,14 +71,10 @@ BOILERPLATE_BLACKLIST = {
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
     "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
-    "__do_global_dtors", "__do_global_ctors", "__main", "_pei386_runtime_relocator",
-    "__mingw_init_ehandler", "__mingw_oldexcpt_handler", "__mingw_SEH_error_handler",
-    "__mingw_prepare_except_for_msvc", "__mingw_setusermatherr",
-    # ── Linux ELF Startup ──
-    "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init",
-    "__libc_csu_fini", "_dl_relocate_static_pie", "__libc_start_main",
-    "_init", "_fini", "__x86.get_pc_thunk.bx", "__x86.get_pc_thunk.ax",
-    # ── MSVC CRT & Windows Startup ──
+    # Linux ELF Startup
+    "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
+    "__libc_csu_fini", "_dl_relocate_static_pie",
+    # MSVC CRT & Windows Startup
     "__scrt_common_main_seh", "_mainCRTStartup", "_wmainCRTStartup", "_WinMainCRTStartup",
     "_DllMainCRTStartup", "__security_init_cookie", "__security_check_cookie",
     "__report_gsfailure", "__local_stdio_printf_options", "__local_stdio_scanf_options",
@@ -261,14 +257,9 @@ def _word_boundary_match(api_name: str, text: str) -> bool:
 CWE_MAPPING = {
     # Stack buffer overflow (CWE-121)
     "strcpy": "CWE-121", "strcat": "CWE-121", "gets": "CWE-121",
-    "sprintf": "CWE-121", "vsprintf": "CWE-121",
-    # Classic buffer overflow / unchecked input (CWE-120)
-    "scanf": "CWE-120", "fscanf": "CWE-120", "sscanf": "CWE-120",
-    # Out-of-bounds write (CWE-787)
-    "memcpy": "CWE-787", "memmove": "CWE-787", "wmemcpy": "CWE-787",
-    # Format string vulnerability (CWE-134)
-    "printf": "CWE-134", "fprintf": "CWE-134", "syslog": "CWE-134",
-    # OS command injection (CWE-78)
+    "sprintf": "CWE-121", "scanf": "CWE-120",
+    "memcpy": "CWE-787", "memmove": "CWE-787",
+    "printf": "CWE-134",
     "system": "CWE-78", "popen": "CWE-78",
     "execl": "CWE-78", "execv": "CWE-78", "execlp": "CWE-78", "execvp": "CWE-78",
     # Use-after-free (CWE-416)
