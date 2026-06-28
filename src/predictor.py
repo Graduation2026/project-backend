@@ -71,6 +71,12 @@ BOILERPLATE_BLACKLIST = {
     "do_pseudo_reloc", "tls_callback_0", "tls_callback_1", "check_managed_app",
     "mark_section_writable", "restore_modified_sections", "duplicate_ppstrings",
     "atexit", "at_quick_exit", "_pre_c_init", "frame_dummy", "register_frame_ctor",
+    
+    # MinGW / GCC Windows Extras (User Provided)
+    "_pei386_runtime_relocator", "_FindPESection", "_FindPESectionByName",
+    "_FindPESectionExec", "_GetPEImageBase", "_IsNonwritableInCurrentImage",
+    "_onexit", "_amsg_exit", "_tzset", "tzset", "_get_output_format", "FUN_140001000",
+    
     # Linux ELF Startup
     "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
     "__libc_csu_fini", "_dl_relocate_static_pie",
@@ -296,6 +302,10 @@ def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
     detected = set()
     for api, cwe in CWE_MAPPING.items():
         if _word_boundary_match(api, text):
+            # Special case: printf is only CWE-134 if format string
+            # is not a static literal (s_ prefix = Ghidra static string)
+            if api == "printf" and "s_" in text:
+                continue  # Static format string — not CWE-134
             detected.add(cwe)
     return ", ".join(sorted(detected)) if detected else "CWE-119"
 
