@@ -257,28 +257,6 @@ def _word_boundary_match(api_name: str, text: str) -> bool:
     """Match API name at word boundaries to prevent substring false matches (e.g. 'gets' in 'fgets')."""
     return bool(re.search(r'(?:^|(?<=[^a-zA-Z0-9_]))' + re.escape(api_name) + r'(?=[^a-zA-Z0-9_]|$)', text))
 
-# API-to-CWE mapping for dynamic CWE assignment (replaces hardcoded CWE-119)
-# This is a first-pass signature-based labeling aid — it provides the CWE tag for
-# the report, NOT a detection mechanism. The GNN handles structural detection.
-CWE_MAPPING = {
-    # Stack buffer overflow (CWE-121)
-    "strcpy": "CWE-121", "strcat": "CWE-121", "gets": "CWE-121",
-    "sprintf": "CWE-121", "scanf": "CWE-120",
-    "memcpy": "CWE-787", "memmove": "CWE-787",
-    "printf": "CWE-134",
-    "system": "CWE-78", "popen": "CWE-78",
-    "execl": "CWE-78", "execv": "CWE-78", "execlp": "CWE-78", "execvp": "CWE-78",
-    # Use-after-free (CWE-416)
-    "free": "CWE-416", "realloc": "CWE-416",
-    # Integer overflow leading to buffer overflow (CWE-190)
-    "malloc": "CWE-190", "calloc": "CWE-190",
-    # Dangerous functions (CWE-242 / CWE-676)
-    "mktemp": "CWE-242", "tmpnam": "CWE-242",
-    "atoi": "CWE-190", "atol": "CWE-190",
-    # Path traversal (CWE-22)
-    "realpath": "CWE-22",
-}
-
 UNSAFE_APIS = {
     "strcpy", "gets", "strcat", "sprintf", "scanf", "system", "popen",
     "vsprintf", "fscanf", "sscanf", "mktemp", "tmpnam",
@@ -294,20 +272,6 @@ SAFE_APIS = {
     # Safe format functions
     "vsnprintf",
 }
-
-
-def detect_cwe_from_code(decompiled_lines: list[str]) -> str:
-    """Scan decompiled code for known API calls and return the most specific CWE."""
-    text = " ".join(decompiled_lines).lower()
-    detected = set()
-    for api, cwe in CWE_MAPPING.items():
-        if _word_boundary_match(api, text):
-            # Special case: printf is only CWE-134 if format string
-            # is not a static literal (s_ prefix = Ghidra static string)
-            if api == "printf" and "s_" in text:
-                continue  # Static format string — not CWE-134
-            detected.add(cwe)
-    return ", ".join(sorted(detected)) if detected else "CWE-119"
 
 
 def is_trivial_stub(fname: str, nodes: list) -> bool:
@@ -558,7 +522,7 @@ class VulnerabilityPredictor:
                     flagged_entry = {
                         "function_name": fname,
                         "decompiled_code": "\n".join(decompiled_lines),
-                        "cwe_id": detect_cwe_from_code(decompiled_lines),
+                        "cwe_id": None,
                         "brief_explanation": explanation,
                         "decision_source": func_decision_source
                     }
@@ -570,7 +534,7 @@ class VulnerabilityPredictor:
                         "is_vulnerable": True,
                         "decision_source": func_decision_source,
                         "explanation": explanation,
-                        "cwe_id": detect_cwe_from_code(decompiled_lines),
+                        "cwe_id": None,
                         "decompiled_code": "\n".join(decompiled_lines)
                     })
                 else:

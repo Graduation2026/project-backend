@@ -237,14 +237,18 @@ class ReportGenerationService:
             color_tier = "Red"
             severity_level = "CRITICAL"
 
-        # Retrieve reference guidelines from Chroma DB (increased k for richer context)
+        # Retrieve reference guidelines from Chroma DB
+        # Query by decompiled assembly code rather than CWE ID string
+        # so embeddings match the actual vulnerability pattern (e.g. OOB array access)
+        # instead of relying on a pre-assigned CWE label.
         retrieved_docs = []
-        unique_cwes = set(func.get('cwe_id', 'CWE-119') for func in flagged_functions)
-        for cwe in unique_cwes:
-            query = f"{cwe} vulnerability exploit mitigation CERT C secure coding"
-            docs = self.vector_store.similarity_search(query, k=3)
-            for d in docs:
-                retrieved_docs.append(d.page_content)
+        for func in flagged_functions:
+            asm_code = func.get('decompiled_code', '')
+            query_lines = "\n".join(asm_code.split('\n')[:20])
+            if query_lines.strip():
+                docs = self.vector_store.similarity_search(query_lines, k=3)
+                for d in docs:
+                    retrieved_docs.append(d.page_content)
 
         reference_context = "\n\n".join(set(retrieved_docs))
 
@@ -254,17 +258,17 @@ class ReportGenerationService:
             fname = func["function_name"]
             if func["is_vulnerable"]:
                 flagged_match = next((f for f in flagged_functions if f["function_name"] == fname), None)
-                cwe_id = func.get("cwe_id", "CWE-119")
+                cwe_id = func.get("cwe_id") or "CWE-119 (to be classified)"
                 category_b_context += f"- `{fname}` | FLAGGED | {cwe_id}\n"
                 if flagged_match and flagged_match.get("decompiled_code"):
                     # Limit decompiled code to first 15 lines to prevent prompt bloat
                     code_lines = flagged_match['decompiled_code'].split('\n')[:15]
-                    category_b_context += f"```\n{'chr(10)'.join(code_lines)}\n```\n"
+                    category_b_context += f"```\n{chr(10).join(code_lines)}\n```\n"
             else:
                 category_b_context += f"- `{fname}` | Safe\n"
 
         # --- Format Category A (names only, comma-separated) ---
-        category_a_names = ""
+        category_a_names = "None"
         if category_a_functions:
             category_a_names = ", ".join([f"`{f['function_name']}`" for f in category_a_functions])
 
@@ -293,14 +297,13 @@ Write a Markdown report with EXACTLY this structure:
 3. `## Executive Summary` — 3-5 sentences max. State the verdict, threat severity ({color_tier}/{severity_level}), and remediation urgency. No filler.
 4. `## Category B - Actual Code Functions` — For each function:
    - SAFE functions: ONE line only. Format: `- function_name - Safe. CFG conforms to secure baselines.`
-   - FLAGGED functions: Maximum 5 bullet points:
-     1. Threat ID (CWE number and name)
+   - FLAGGED functions: Maximum 4 bullet points. Base the CWE on the assembly/CFG evidence shown — DO NOT guess a CWE number if the pattern is unclear; state "CWE-119 (Memory Operations)".
+     1. Threat ID (CWE number and name — classify from the assembly)
      2. One-line root cause
      3. CERT C rule violated
-     4. 3-5 line remediation code snippet in a code block
-     5. One-line fix summary
+     4. One-line high-level fix direction (no fabricated code snippets — you do not have the source)
 5. `## General Mitigations` — 5 bullet points max covering compiler hardening (canaries, DEP, ASLR, RELRO, FORTIFY_SOURCE).
-6. `## Category A - Boilerplate & Runtime Stubs` — One explanation sentence, then the comma-separated names list.
+6. `## Category A - Boilerplate & Runtime Stubs` — If "None", write "No boilerplate functions filtered." Otherwise, one explanation sentence, then the comma-separated names list.
 
 CRITICAL RULES:
 - Keep the ENTIRE report under 2,500 words.
@@ -308,7 +311,8 @@ CRITICAL RULES:
 - Do NOT use "VULNERABLE" or "CLEAN" as standalone headers.
 - Do NOT pad with general cybersecurity lectures. Be surgical and actionable.
 - Do NOT repeat information already stated in other sections.
-- Use the verdict "{verdict}" verbatim when referencing the outcome."""
+- Use the verdict "{verdict}" verbatim when referencing the outcome.
+- You only have assembly/CFG data, NOT the original source code. Do not fabricate C code snippets."""
 
         logger.info("Invoking Gemini to compile security report...")
         response = self._invoke_llm_with_retry(prompt)
