@@ -497,6 +497,20 @@ async def analyze_binary(file: UploadFile = File(...), _auth_ok: bool = Depends(
             boilerplate_count=result["boilerplate_count"],
         )
         
+        # The RAG service parses a CWE for each flagged function during report
+        # generation and writes it back onto the flagged_functions entries
+        # (predictor.py emits cwe_id=None). Propagate those CWEs into
+        # category_b_functions so the inline UI cards can display them.
+        cwe_by_name = {
+            f["function_name"]: f.get("cwe_id")
+            for f in result["flagged_functions"]
+            if f.get("cwe_id")
+        }
+        if cwe_by_name:
+            for func in result["category_b_functions"]:
+                if func.get("is_vulnerable") and cwe_by_name.get(func["function_name"]):
+                    func["cwe_id"] = cwe_by_name[func["function_name"]]
+
         pdf_filename = f"report_{sha256_hash}.pdf"
         pdf_path = reports_static_dir / pdf_filename
         
