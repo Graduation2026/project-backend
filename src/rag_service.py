@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import logging
 import threading
 
@@ -8,14 +7,11 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 from pathlib import Path
 from dotenv import load_dotenv
 
-# LangChain LLM imports — Google GenAI for LLM, HuggingFace for local embeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+# LangChain LLM imports — Ollama for local LLM, HuggingFace for local embeddings
+from langchain_ollama import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
-
-# Google API error types for retry logic
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -29,58 +25,48 @@ CHROMA_REF_DIR = Path(os.getenv(
     str(PROJECT_ROOT / "temp" / "chroma_db_reference")
 ))
 
-# Rate-limit sleep between LLM calls (seconds). Gemma 4 31B allows 15 RPM,
-# so 5 s between calls keeps us comfortably within the window.
-LLM_CALL_DELAY = 5
+# Ollama base URL — override via OLLAMA_BASE_URL env var if Ollama is on another host.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 
 class ReportGenerationService:
     def __init__(self):
         self._lock = threading.Lock()
-        self.api_key = os.getenv("GOOGLE_API_KEY", "")
-        self.model_name = os.getenv("GOOGLE_MODEL", "gemma-4-31b-it")
+        self.model_name = os.getenv("OLLAMA_MODEL", "qwen3:4b")
         self.embeddings = None
         self.vector_store = None
         self.llm = None
         self._is_initialized = False
 
     @retry(
-        wait=wait_exponential(multiplier=2, min=5, max=120),
-        stop=stop_after_attempt(5),
-        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, DeadlineExceeded)),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True
     )
     def _invoke_llm_with_retry(self, prompt: str):
-        """Invoke the LLM with exponential backoff on Google API rate-limit / transient errors."""
+        """Invoke the local Ollama LLM with retry on connection errors."""
         result = self.llm.invoke(prompt)
-        time.sleep(LLM_CALL_DELAY)  # Respect 15 RPM limit for Gemma 4 31B
         return result
 
     def initialize(self):
-        """Initializes the embeddings, vector store, and Google GenAI LLM (thread-safe)."""
+        """Initializes the embeddings, vector store, and local Ollama LLM (thread-safe)."""
         with self._lock:
             if self._is_initialized:
                 return
-
-            if not self.api_key:
-                raise ValueError(
-                    "GOOGLE_API_KEY is not set. "
-                    "Please add it to your .env file. "
-                    "Get a free key at https://aistudio.google.com/apikey"
-                )
 
             logger.info("Initializing context-enriched report generation service (HuggingFace local embeddings)...")
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="all-MiniLM-L6-v2"
             )
 
-            logger.info(f"Using Google GenAI LLM '{self.model_name}'")
-            self.llm = ChatGoogleGenerativeAI(
+            logger.info(f"Using local Ollama LLM '{self.model_name}' at {OLLAMA_BASE_URL}")
+            self.llm = ChatOllama(
                 model=self.model_name,
+                base_url=OLLAMA_BASE_URL,
                 temperature=0.2,
-                max_output_tokens=4096,
-                google_api_key=self.api_key,
+                num_predict=4096,
             )
 
             CHROMA_REF_DIR.mkdir(parents=True, exist_ok=True)
@@ -276,7 +262,7 @@ class ReportGenerationService:
     @staticmethod
     def _content_to_text(content) -> str:
         """Flatten LangChain message content to plain text, dropping non-text
-        parts (e.g. Gemma 'thinking' reasoning blocks that have no 'text' key)."""
+        parts (e.g. thinking/reasoning blocks that have no 'text' key)."""
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -570,7 +556,8 @@ Important: If the conversation is already underway (i.e., Conversation History c
 Please formulate an elegant, friendly, and expert answer. Structure it with clear paragraphs or bullet points if needed. Ground your response heavily in secure C/C++ coding guidelines and explain concepts in a clear, developer-friendly manner.
 """
 
-        logger.info(f"Invoking Google GenAI chatbot for query: '{query[:40]}...'")
+        logger.info(f"Invoking Ollama chatbot for query: '{query[:40]}...'")
+
         response = self._invoke_llm_with_retry(prompt)
 
         return self._content_to_text(response.content).strip()
