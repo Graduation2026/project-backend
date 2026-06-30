@@ -79,7 +79,7 @@ BOILERPLATE_BLACKLIST = {
     
     # Linux ELF Startup
     "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
-    "__libc_csu_fini", "_dl_relocate_static_pie",
+    "__libc_csu_fini", "_dl_relocate_static_pie", "_init", "entry", "_start_c", "_fini",
     # MSVC CRT & Windows Startup
     "__scrt_common_main_seh", "_mainCRTStartup", "_wmainCRTStartup", "_WinMainCRTStartup",
     "_DllMainCRTStartup", "__security_init_cookie", "__security_check_cookie",

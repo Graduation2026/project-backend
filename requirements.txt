@@ -28,11 +28,17 @@ torch>=2.0.0
 torch-geometric>=2.4.0
 gensim>=4.3.0
 
-# LangChain RAG with Google Gemini
+# LangChain RAG — Google GenAI (Gemma 4 31B) for report generation + local embeddings
 langchain-google-genai>=1.0.0
+google-api-core>=2.0.0
 langchain-community>=0.2.0
 langchain-core>=0.2.0
 chromadb>=0.5.0
+sentence-transformers>=2.2.0
+# Legacy providers (no longer used; kept for backward compatibility)
+# langchain-ollama>=0.2.0
+# langchain-openai>=0.1.0
+# openai>=1.30.0
 
 # PDF Report Generation
 fpdf2>=2.7.0

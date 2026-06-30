@@ -1,18 +1,21 @@
 import os
 import re
+import time
 import logging
 import threading
 
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, before_sleep_log
-from google.api_core.exceptions import ResourceExhausted, TooManyRequests
 from pathlib import Path
 from dotenv import load_dotenv
 
-# LangChain and Gemini imports
+# LangChain LLM imports — Google GenAI for LLM, HuggingFace for local embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
+
+# Google API error types for retry logic
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -20,48 +23,64 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-# Reference Database directory
-CHROMA_REF_DIR = PROJECT_ROOT / "temp" / "chroma_db_reference"
+# Reference Database directory — uses HuggingFace local embeddings.
+CHROMA_REF_DIR = Path(os.getenv(
+    "CHROMA_REF_DIR",
+    str(PROJECT_ROOT / "temp" / "chroma_db_reference")
+))
+
+# Rate-limit sleep between LLM calls (seconds). Gemma 4 31B allows 15 RPM,
+# so 5 s between calls keeps us comfortably within the window.
+LLM_CALL_DELAY = 5
+
 
 class ReportGenerationService:
     def __init__(self):
         self._lock = threading.Lock()
-        self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.api_key = os.getenv("GOOGLE_API_KEY", "")
+        self.model_name = os.getenv("GOOGLE_MODEL", "gemma-4-31b-it")
         self.embeddings = None
         self.vector_store = None
         self.llm = None
         self._is_initialized = False
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=60),
+        wait=wait_exponential(multiplier=2, min=5, max=120),
         stop=stop_after_attempt(5),
-        retry=retry_if_exception_type((ResourceExhausted, TooManyRequests)),
+        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, DeadlineExceeded)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True
     )
     def _invoke_llm_with_retry(self, prompt: str):
-        """Invoke the LLM with exponential backoff on rate-limit errors."""
-        return self.llm.invoke(prompt)
+        """Invoke the LLM with exponential backoff on Google API rate-limit / transient errors."""
+        result = self.llm.invoke(prompt)
+        time.sleep(LLM_CALL_DELAY)  # Respect 15 RPM limit for Gemma 4 31B
+        return result
 
     def initialize(self):
-        """Initializes the embeddings, vector store, and Gemini LLM (thread-safe)."""
+        """Initializes the embeddings, vector store, and Google GenAI LLM (thread-safe)."""
         with self._lock:
             if self._is_initialized:
                 return
 
             if not self.api_key:
-                raise ValueError("Google Gemini API Key not found in environment variables.")
+                raise ValueError(
+                    "GOOGLE_API_KEY is not set. "
+                    "Please add it to your .env file. "
+                    "Get a free key at https://aistudio.google.com/apikey"
+                )
 
             logger.info("Initializing context-enriched report generation service (HuggingFace local embeddings)...")
             self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
+                model_name="all-MiniLM-L6-v2"
             )
 
+            logger.info(f"Using Google GenAI LLM '{self.model_name}'")
             self.llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
+                model=self.model_name,
                 temperature=0.2,
                 max_output_tokens=4096,
-                google_api_key=self.api_key
+                google_api_key=self.api_key,
             )
 
             CHROMA_REF_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,6 +274,25 @@ class ReportGenerationService:
         return "\n\n".join(retrieved)
 
     @staticmethod
+    def _content_to_text(content) -> str:
+        """Flatten LangChain message content to plain text, dropping non-text
+        parts (e.g. Gemma 'thinking' reasoning blocks that have no 'text' key)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text"):
+                        parts.append(item["text"])
+                    elif "text" in item and isinstance(item["text"], str):
+                        parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+        return str(content)
+
+    @staticmethod
     def _extract_cwe_id(block: str) -> str:
         """Pull a human-readable CWE label out of an analysis block.
 
@@ -273,7 +311,7 @@ class ReportGenerationService:
         self, chunk: list[dict], ref_context: str,
         chunk_num: int, total_chunks: int
     ) -> str:
-        """Send a batch of flagged functions to Gemini. Returns formatted markdown."""
+        """Send a batch of flagged functions to the Google GenAI LLM. Returns formatted markdown."""
         func_contexts = []
         for i, func in enumerate(chunk):
             fname = func["function_name"]
@@ -312,10 +350,7 @@ CRITICAL RULES:
         logger.info(f"Analyzing flagged functions batch {chunk_num}/{total_chunks}...")
         response = self._invoke_llm_with_retry(prompt)
 
-        content = response.content
-        if isinstance(content, list):
-            content = "\n".join([str(item) if not isinstance(item, dict) else item.get("text", str(item)) for item in content])
-        analysis_text = content.strip()
+        analysis_text = self._content_to_text(response.content).strip()
 
         # Parse numbered blocks (1. ... 2. ... etc.)
         numbered_blocks = re.split(r'\n(?=\d+\.\s)', analysis_text)
@@ -374,10 +409,7 @@ Write a concise, qualitative executive summary. State the verdict, threat severi
         logger.info("Generating qualitative Executive Summary...")
         response = self._invoke_llm_with_retry(prompt)
 
-        content = response.content
-        if isinstance(content, list):
-            content = "\n".join([str(item) if not isinstance(item, dict) else item.get("text", str(item)) for item in content])
-        return content.strip()
+        return self._content_to_text(response.content).strip()
 
     def generate_vulnerability_report(
         self,
@@ -394,7 +426,7 @@ Write a concise, qualitative executive summary. State the verdict, threat severi
         Generates a concise, actionable Markdown security report using a hybrid
         Python/LLM approach. Python handles deterministic sections (metadata,
         mitigations, safe functions, boilerplate). Flagged functions are chunked
-        into small batches to bypass Gemini safety filters and maintain quality.
+        into small batches to keep prompts focused and maintain output quality.
         """
         self.initialize()
 
@@ -538,13 +570,10 @@ Important: If the conversation is already underway (i.e., Conversation History c
 Please formulate an elegant, friendly, and expert answer. Structure it with clear paragraphs or bullet points if needed. Ground your response heavily in secure C/C++ coding guidelines and explain concepts in a clear, developer-friendly manner.
 """
 
-        logger.info(f"Invoking Gemini chatbot for query: '{query[:40]}...'")
+        logger.info(f"Invoking Google GenAI chatbot for query: '{query[:40]}...'")
         response = self._invoke_llm_with_retry(prompt)
-        
-        content = response.content
-        if isinstance(content, list):
-            content = "\n".join([str(item) if not isinstance(item, dict) else item.get("text", str(item)) for item in content])
-        return content.strip()
+
+        return self._content_to_text(response.content).strip()
 
 
 # Module singleton
