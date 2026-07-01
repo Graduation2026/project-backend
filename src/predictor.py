@@ -19,9 +19,14 @@ import torch.nn.functional as F
 # If torch_geometric is imported, ensure it handles CPU/GPU gracefully
 from torch_geometric.data import Data
 from torch_geometric.nn import GATv2Conv, global_max_pool, global_mean_pool
-from gensim.models import Word2Vec
-
 logger = logging.getLogger(__name__)
+
+try:
+    from gensim.models import Word2Vec
+except ImportError:
+    Word2Vec = None
+    logger.warning("gensim is not installed — Word2Vec embeddings will be unavailable. "
+                   "Install gensim or use Python ≤3.12 for full functionality.")
 
 # Define VulnGNN model architecture to match training precisely
 class VulnGNN(torch.nn.Module):
@@ -322,7 +327,12 @@ class VulnerabilityPredictor:
                 raise FileNotFoundError(f"GNN model weights not found at: {self.gnn_path}")
 
             logger.info(f"Loading Word2Vec model from {self.w2v_path}...")
-            self._w2v_model = Word2Vec.load(str(self.w2v_path))
+            if Word2Vec is None:
+                logger.warning("⚠️ gensim is not installed — Word2Vec model cannot be loaded. "
+                               "Predictions will not be available locally.")
+                self._w2v_model = None
+            else:
+                self._w2v_model = Word2Vec.load(str(self.w2v_path))
 
             # Load fold 4 (primary model)
             model_paths = {
@@ -372,6 +382,12 @@ class VulnerabilityPredictor:
 
             with open(json_path, "r", encoding="utf-8", errors="ignore") as f:
                 functions_list = json.load(f)
+
+            logger.info(
+                f"🧩 [GNN Predict] Running LOCAL GNN inference on {len(functions_list)} extracted "
+                f"function(s) | device={self.device} | active_folds={list(self._gnn_models.keys())} | "
+                f"w2v_loaded={self._w2v_model is not None} (source={self.gnn_path.name})"
+            )
 
             if not functions_list:
                 return {

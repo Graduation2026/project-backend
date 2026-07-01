@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 import threading
 
@@ -47,7 +48,36 @@ class ReportGenerationService:
     )
     def _invoke_llm_with_retry(self, prompt: str):
         """Invoke the local Ollama LLM with retry on connection errors."""
+        prompt_chars = len(prompt) if isinstance(prompt, str) else len(str(prompt))
+        logger.info(
+            f"🧠 [LLM Invoke] Sending request to LOCAL Ollama model '{self.model_name}' "
+            f"at {OLLAMA_BASE_URL} (prompt: {prompt_chars} chars / ~{prompt_chars // 4} tokens)..."
+        )
+        t0 = time.time()
         result = self.llm.invoke(prompt)
+        latency = time.time() - t0
+
+        # Confirm the response genuinely came from the local model and log telemetry.
+        # ChatOllama returns an AIMessage carrying response_metadata with the model
+        # name and token counts straight from the Ollama runtime — this is the
+        # ground-truth proof that the local model served the request.
+        meta = getattr(result, "response_metadata", {}) or {}
+        served_by = meta.get("model", "unknown")
+        eval_count = meta.get("eval_count")
+        prompt_eval_count = meta.get("prompt_eval_count")
+        done_reason = meta.get("done_reason")
+        resp_text = self._content_to_text(getattr(result, "content", "")) or ""
+        logger.info(
+            f"✅ [LLM Invoke] LOCAL model responded in {latency:.2f}s "
+            f"(served_by='{served_by}', prompt_tokens={prompt_eval_count}, "
+            f"output_tokens={eval_count}, done_reason='{done_reason}', "
+            f"response: {len(resp_text)} chars)"
+        )
+        if served_by == "unknown":
+            logger.warning(
+                "⚠️ [LLM Invoke] Response carried no model metadata — cannot confirm "
+                "which backend served this request. Verify Ollama is the active LLM."
+            )
         return result
 
     def initialize(self):
@@ -68,6 +98,11 @@ class ReportGenerationService:
                 temperature=0.2,
                 num_predict=4096,
             )
+            logger.info(
+                f"🔗 [LLM Binding] LLM bound -> class={type(self.llm).__module__}.{type(self.llm).__name__}, "
+                f"model='{self.model_name}', base_url='{OLLAMA_BASE_URL}'. "
+                f"All report/chat generation will route through this LOCAL model."
+            )
 
             CHROMA_REF_DIR.mkdir(parents=True, exist_ok=True)
             self.vector_store = Chroma(
@@ -78,6 +113,111 @@ class ReportGenerationService:
             self.seed_db_if_empty()
             self._is_initialized = True
             logger.info("✅ Context-enriched report service initialized successfully.")
+            
+            # Check Ollama and model health at startup/initialization
+            try:
+                self.check_llm_health()
+            except Exception as ex:
+                logger.error(f"❌ LLM health check encountered an error: {str(ex)}")
+
+    def check_llm_health(self) -> dict:
+        """
+        Check if the local Ollama LLM service is running and the target model is ready/responsive.
+        Logs comprehensive details about status, latency, and available models.
+        """
+        import requests
+        status = {
+            "ollama_connected": False,
+            "model_available": False,
+            "model_responsive": False,
+            "latency_seconds": 0.0,
+            "message": "",
+            "available_models": []
+        }
+        
+        url = OLLAMA_BASE_URL.rstrip("/")
+        logger.info(f"🔍 [Ollama Health Check] Connecting to Ollama server at: {url}...")
+        
+        # 1. Check if Ollama service is reachable
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                status["ollama_connected"] = True
+                logger.info("✅ [Ollama Health Check] Connected to Ollama server successfully.")
+            else:
+                status["message"] = f"Ollama base URL returned status code {response.status_code}"
+                logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                return status
+        except requests.exceptions.RequestException as e:
+            status["message"] = f"Failed to connect to Ollama server at {url}: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+            return status
+
+        # 2. Check if the model is downloaded/available
+        try:
+            tags_url = f"{url}/api/tags"
+            tags_resp = requests.get(tags_url, timeout=5)
+            if tags_resp.status_code == 200:
+                data = tags_resp.json()
+                models = [m["name"] for m in data.get("models", [])]
+                status["available_models"] = models
+                logger.info(f"📋 [Ollama Health Check] Available models in Ollama: {models}")
+                
+                target = self.model_name
+                found = False
+                for m in models:
+                    if m == target or m.startswith(target + ":") or target.startswith(m + ":"):
+                        found = True
+                        break
+                
+                if found:
+                    status["model_available"] = True
+                    logger.info(f"✅ [Ollama Health Check] Target model '{target}' is downloaded and ready.")
+                else:
+                    status["message"] = f"Target model '{target}' is NOT loaded/available in Ollama. Available: {models}"
+                    logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                    return status
+            else:
+                status["message"] = f"Failed to fetch tags from Ollama API: HTTP {tags_resp.status_code}"
+                logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                return status
+        except Exception as e:
+            status["message"] = f"Error checking models on Ollama: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+            return status
+
+        # 3. Test model responsiveness with a lightweight query
+        try:
+            logger.info(f"⚡ [Ollama Health Check] Testing responsiveness for model '{self.model_name}'...")
+            t0 = time.time()
+            gen_url = f"{url}/api/generate"
+            payload = {
+                "model": self.model_name,
+                "prompt": "respond with 'pong' only",
+                "stream": False,
+                "options": {
+                    "num_predict": 5
+                }
+            }
+            gen_resp = requests.post(gen_url, json=payload, timeout=15)
+            latency = time.time() - t0
+            status["latency_seconds"] = round(latency, 3)
+            
+            if gen_resp.status_code == 200:
+                resp_json = gen_resp.json()
+                response_text = resp_json.get("response", "").strip()
+                status["model_responsive"] = True
+                status["message"] = f"Model is active and healthy. Response: '{response_text}'"
+                logger.info(f"✅ [Ollama Health Check] Model responded in {status['latency_seconds']}s. Response: '{response_text}'")
+                logger.info("💚 [Ollama Health Check] ALL SYSTEMS HEALTHY.")
+            else:
+                status["message"] = f"Test generation failed: HTTP {gen_resp.status_code} - {gen_resp.text}"
+                logger.error(f"❌ [Ollama Health Check] {status['message']}")
+        except Exception as e:
+            status["message"] = f"Test generation threw an exception: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+
+        return status
 
     def seed_db_if_empty(self):
         """Seeds the vector store from the knowledge_base/ directory.

@@ -1,21 +1,33 @@
 services:
-  # The Brain: FastAPI Backend + Ghidra Engine
+  # The Brain: FastAPI Backend + Ghidra (CPU). The qwen3:4b LLM runs in a
+  # native, GPU-accelerated Ollama on the host; this container reaches it via
+  # host.docker.internal.
   sentinel-backend:
     build: .
     container_name: sentinel-backend
     ports:
-      - "8000:8000"
+      # Host port 8080 (8000 is used by another local project); the container
+      # still listens on 8000 internally, which is what the frontend proxies to.
+      - "8080:8000"
     volumes:
       - sentinel-temp:/app/temp
+    # Map host.docker.internal to the host gateway so the container can reach
+    # the native Ollama running on the Windows host (Docker Desktop provides
+    # this automatically, but declaring it keeps behaviour explicit/portable).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - GHIDRA_INSTALL_DIR=/opt/ghidra
       - FEATURES_DIR=/app/temp/features
       - PYTHONUNBUFFERED=1
-      - _JAVA_OPTIONS="-Xmx2G"
+      - _JAVA_OPTIONS=-Xmx2G
+      - OLLAMA_MODEL=qwen3:4b
+      # Point at the host's native Ollama (GPU) instead of an in-container one.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 6G
     restart: unless-stopped
 
   # The Face: Nginx Web Server for the Dashboard

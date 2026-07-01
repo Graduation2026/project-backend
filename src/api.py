@@ -208,6 +208,14 @@ async def lifespan(app: FastAPI):
     except FileNotFoundError as e:
         logger.warning(f"Models not loaded: {e}")
         logger.warning("The /analyze endpoint will fail until models are trained.")
+    
+    # Initialize RAG service on startup to trigger the Ollama health check
+    try:
+        logger.info("Initializing RAG service and verifying local LLM connection...")
+        rag_service.initialize()
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize RAG service on startup: {str(e)}")
+        
     yield
     logger.info("Shutting down API.")
 
@@ -298,12 +306,22 @@ if frontend_static.exists():
 # --- GET /health ---
 @app.get("/health", tags=["General"])
 async def health_check():
-    """Check system health: model status, Ghidra availability."""
+    """Check system health: model status, Ghidra availability, and Ollama LLM status."""
+    llm_health = {"status": "uninitialized"}
+    try:
+        if rag_service._is_initialized:
+            llm_health = rag_service.check_llm_health()
+        else:
+            llm_health = {"status": "not initialized"}
+    except Exception as e:
+        llm_health = {"error": str(e)}
+
     return {
         "status": "healthy",
         "model_loaded": predictor.is_loaded,
         "ghidra_available": GHIDRA_HEADLESS.exists(),
         "ghidra_path": str(GHIDRA_HEADLESS),
+        "llm_health": llm_health,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

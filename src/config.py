@@ -15,7 +15,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 # ─── GHIDRA CONFIGURATION ───────────────────────────────────────────────────
 GHIDRA_INSTALL_DIR = Path(
-    os.getenv("GHIDRA_INSTALL_DIR", "d:/ml_binpool_attempt/ghidra_12.0.3_PUBLIC")
+    os.getenv("GHIDRA_INSTALL_DIR")
 )
 _ghidra_executable = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
 GHIDRA_HEADLESS = GHIDRA_INSTALL_DIR / "support" / _ghidra_executable
