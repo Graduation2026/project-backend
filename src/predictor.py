@@ -139,6 +139,8 @@ BOILERPLATE_BLACKLIST = {
     # ── Rust Runtime (if analyzing Rust binaries) ──
     "__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed",
     "__rust_alloc_error_handler",
+    # ── Additional User-Requested Boilerplate Functions ──
+    "_ValidateImageBase", "fpreset", "_matherr", "_setargv",
 }
 
 CPP_LIB_KEYWORDS = {
