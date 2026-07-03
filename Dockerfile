@@ -13,21 +13,29 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# ── System dependencies (Java 17 for Ghidra) ────────────────────────────────
+# ── System dependencies (curl for Ollama installer, wget/unzip/tar for JDK and Ghidra) ──────
 RUN apt-get update && apt-get install -y \
     build-essential \
-    openjdk-17-jdk \
     wget \
     unzip \
     curl \
     zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Ghidra 11.0.1 ───────────────────────────────────────────────────────────
-RUN wget --progress=dot:giga https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.1_build/ghidra_11.0.1_PUBLIC_20240130.zip \
-    && unzip ghidra_11.0.1_PUBLIC_20240130.zip -d /opt \
-    && rm ghidra_11.0.1_PUBLIC_20240130.zip \
-    && mv /opt/ghidra_11.0.1_PUBLIC /opt/ghidra
+# ── JDK 21 (Required for Ghidra 12.0+) ──────────────────────────────────────
+RUN wget https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.2%2B13/OpenJDK21U-jdk_x64_linux_hotspot_21.0.2_13.tar.gz \
+    && mkdir -p /opt/java \
+    && tar -xzf OpenJDK21U-jdk_x64_linux_hotspot_21.0.2_13.tar.gz -C /opt/java \
+    && rm OpenJDK21U-jdk_x64_linux_hotspot_21.0.2_13.tar.gz
+
+ENV JAVA_HOME=/opt/java/jdk-21.0.2+13
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# ── Ghidra 12.0.3 ───────────────────────────────────────────────────────────
+RUN wget --progress=dot:giga https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0.3_build/ghidra_12.0.3_PUBLIC_20260210.zip \
+    && unzip ghidra_12.0.3_PUBLIC_20260210.zip -d /opt \
+    && rm ghidra_12.0.3_PUBLIC_20260210.zip \
+    && mv /opt/ghidra_12.0.3_PUBLIC /opt/ghidra
 
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
