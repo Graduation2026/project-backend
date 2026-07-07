@@ -8,14 +8,11 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 from pathlib import Path
 from dotenv import load_dotenv
 
-# LangChain LLM imports — Google GenAI for LLM, HuggingFace for local embeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+# LangChain LLM imports — Ollama for local LLM, HuggingFace for local embeddings
+from langchain_ollama import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
-
-# Google API error types for retry logic
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -29,58 +26,78 @@ CHROMA_REF_DIR = Path(os.getenv(
     str(PROJECT_ROOT / "temp" / "chroma_db_reference")
 ))
 
-# Rate-limit sleep between LLM calls (seconds). Gemma 4 31B allows 15 RPM,
-# so 5 s between calls keeps us comfortably within the window.
-LLM_CALL_DELAY = 5
+# Ollama base URL — override via OLLAMA_BASE_URL env var if Ollama is on another host.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 
 class ReportGenerationService:
     def __init__(self):
         self._lock = threading.Lock()
-        self.api_key = os.getenv("GOOGLE_API_KEY", "")
-        self.model_name = os.getenv("GOOGLE_MODEL", "gemma-4-31b-it")
+        self.model_name = os.getenv("OLLAMA_MODEL", "qwen3:4b")
         self.embeddings = None
         self.vector_store = None
         self.llm = None
         self._is_initialized = False
 
     @retry(
-        wait=wait_exponential(multiplier=2, min=5, max=120),
-        stop=stop_after_attempt(5),
-        retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, DeadlineExceeded)),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True
     )
     def _invoke_llm_with_retry(self, prompt: str):
-        """Invoke the LLM with exponential backoff on Google API rate-limit / transient errors."""
+        """Invoke the local Ollama LLM with retry on connection errors."""
+        prompt_chars = len(prompt) if isinstance(prompt, str) else len(str(prompt))
+        logger.info(
+            f"🧠 [LLM Invoke] Sending request to LOCAL Ollama model '{self.model_name}' "
+            f"at {OLLAMA_BASE_URL} (prompt: {prompt_chars} chars / ~{prompt_chars // 4} tokens)..."
+        )
+        t0 = time.time()
         result = self.llm.invoke(prompt)
-        time.sleep(LLM_CALL_DELAY)  # Respect 15 RPM limit for Gemma 4 31B
+        latency = time.time() - t0
+
+        meta = getattr(result, "response_metadata", {}) or {}
+        served_by = meta.get("model", "unknown")
+        eval_count = meta.get("eval_count")
+        prompt_eval_count = meta.get("prompt_eval_count")
+        done_reason = meta.get("done_reason")
+        resp_text = self._content_to_text(getattr(result, "content", "")) or ""
+        logger.info(
+            f"✅ [LLM Invoke] LOCAL model responded in {latency:.2f}s "
+            f"(served_by='{served_by}', prompt_tokens={prompt_eval_count}, "
+            f"output_tokens={eval_count}, done_reason='{done_reason}', "
+            f"response: {len(resp_text)} chars)"
+        )
+        if served_by == "unknown":
+            logger.warning(
+                "⚠️ [LLM Invoke] Response carried no model metadata — cannot confirm "
+                "which backend served this request. Verify Ollama is the active LLM."
+            )
         return result
 
     def initialize(self):
-        """Initializes the embeddings, vector store, and Google GenAI LLM (thread-safe)."""
+        """Initializes the embeddings, vector store, and local Ollama LLM (thread-safe)."""
         with self._lock:
             if self._is_initialized:
                 return
-
-            if not self.api_key:
-                raise ValueError(
-                    "GOOGLE_API_KEY is not set. "
-                    "Please add it to your .env file. "
-                    "Get a free key at https://aistudio.google.com/apikey"
-                )
 
             logger.info("Initializing context-enriched report generation service (HuggingFace local embeddings)...")
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="all-MiniLM-L6-v2"
             )
 
-            logger.info(f"Using Google GenAI LLM '{self.model_name}'")
-            self.llm = ChatGoogleGenerativeAI(
+            logger.info(f"Using local Ollama LLM '{self.model_name}' at {OLLAMA_BASE_URL}")
+            self.llm = ChatOllama(
                 model=self.model_name,
+                base_url=OLLAMA_BASE_URL,
                 temperature=0.2,
-                max_output_tokens=4096,
-                google_api_key=self.api_key,
+                num_predict=4096,
+            )
+            logger.info(
+                f"🔗 [LLM Binding] LLM bound -> class={type(self.llm).__module__}.{type(self.llm).__name__}, "
+                f"model='{self.model_name}', base_url='{OLLAMA_BASE_URL}'. "
+                f"All report/chat generation will route through this LOCAL model."
             )
 
             CHROMA_REF_DIR.mkdir(parents=True, exist_ok=True)
@@ -92,6 +109,107 @@ class ReportGenerationService:
             self.seed_db_if_empty()
             self._is_initialized = True
             logger.info("✅ Context-enriched report service initialized successfully.")
+
+            try:
+                self.check_llm_health()
+            except Exception as ex:
+                logger.error(f"❌ LLM health check encountered an error: {str(ex)}")
+
+    def check_llm_health(self) -> dict:
+        """
+        Check if the local Ollama LLM service is running and the target model is ready/responsive.
+        Logs comprehensive details about status, latency, and available models.
+        """
+        import requests
+        status = {
+            "ollama_connected": False,
+            "model_available": False,
+            "model_responsive": False,
+            "latency_seconds": 0.0,
+            "message": "",
+            "available_models": []
+        }
+
+        url = OLLAMA_BASE_URL.rstrip("/")
+        logger.info(f"🔍 [Ollama Health Check] Connecting to Ollama server at: {url}...")
+
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                status["ollama_connected"] = True
+                logger.info("✅ [Ollama Health Check] Connected to Ollama server successfully.")
+            else:
+                status["message"] = f"Ollama base URL returned status code {response.status_code}"
+                logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                return status
+        except requests.exceptions.RequestException as e:
+            status["message"] = f"Failed to connect to Ollama server at {url}: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+            return status
+
+        try:
+            tags_url = f"{url}/api/tags"
+            tags_resp = requests.get(tags_url, timeout=5)
+            if tags_resp.status_code == 200:
+                data = tags_resp.json()
+                models = [m["name"] for m in data.get("models", [])]
+                status["available_models"] = models
+                logger.info(f"📋 [Ollama Health Check] Available models in Ollama: {models}")
+
+                target = self.model_name
+                found = False
+                for m in models:
+                    if m == target or m.startswith(target + ":") or target.startswith(m + ":"):
+                        found = True
+                        break
+
+                if found:
+                    status["model_available"] = True
+                    logger.info(f"✅ [Ollama Health Check] Target model '{target}' is downloaded and ready.")
+                else:
+                    status["message"] = f"Target model '{target}' is NOT loaded/available in Ollama. Available: {models}"
+                    logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                    return status
+            else:
+                status["message"] = f"Failed to fetch tags from Ollama API: HTTP {tags_resp.status_code}"
+                logger.warning(f"⚠️ [Ollama Health Check] {status['message']}")
+                return status
+        except Exception as e:
+            status["message"] = f"Error checking models on Ollama: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+            return status
+
+        try:
+            logger.info(f"⚡ [Ollama Health Check] Testing responsiveness for model '{self.model_name}'...")
+            t0 = time.time()
+            gen_url = f"{url}/api/generate"
+            payload = {
+                "model": self.model_name,
+                "prompt": "respond with 'pong' only",
+                "stream": False,
+                "options": {
+                    "num_predict": 5
+                }
+            }
+            gen_resp = requests.post(gen_url, json=payload, timeout=15)
+            latency = time.time() - t0
+            status["latency_seconds"] = round(latency, 3)
+
+            if gen_resp.status_code == 200:
+                resp_json = gen_resp.json()
+                response_text = resp_json.get("response", "").strip()
+                status["model_responsive"] = True
+                status["message"] = f"Model is active and healthy. Response: '{response_text}'"
+                logger.info(f"✅ [Ollama Health Check] Model responded in {status['latency_seconds']}s. Response: '{response_text}'")
+                logger.info("💚 [Ollama Health Check] ALL SYSTEMS HEALTHY.")
+            else:
+                status["message"] = f"Test generation failed: HTTP {gen_resp.status_code} - {gen_resp.text}"
+                logger.error(f"❌ [Ollama Health Check] {status['message']}")
+        except Exception as e:
+            status["message"] = f"Test generation threw an exception: {str(e)}"
+            logger.error(f"❌ [Ollama Health Check] {status['message']}")
+
+        return status
 
     def seed_db_if_empty(self):
         """Seeds the vector store from the knowledge_base/ directory.
@@ -277,7 +395,7 @@ class ReportGenerationService:
     @staticmethod
     def _content_to_text(content) -> str:
         """Flatten LangChain message content to plain text, dropping non-text
-        parts (e.g. Gemma 'thinking' reasoning blocks that have no 'text' key)."""
+        parts (e.g. thinking/reasoning blocks that have no 'text' key)."""
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -313,7 +431,7 @@ class ReportGenerationService:
         self, chunk: list[dict], ref_context: str,
         chunk_num: int, total_chunks: int
     ) -> str:
-        """Send a batch of flagged functions to the Google GenAI LLM. Returns formatted markdown."""
+        """Send a batch of flagged functions to the local Ollama LLM. Returns formatted markdown."""
         func_contexts = []
         for i, func in enumerate(chunk):
             fname = func["function_name"]
@@ -573,7 +691,7 @@ Important: If the conversation is already underway (i.e., Conversation History c
 Please formulate an elegant, friendly, and expert answer. Structure it with clear paragraphs or bullet points if needed. Ground your response heavily in secure C/C++ coding guidelines and explain concepts in a clear, developer-friendly manner.
 """
 
-        logger.info(f"Invoking Google GenAI chatbot for query: '{query[:40]}...'")
+        logger.info(f"Invoking Ollama chatbot for query: '{query[:40]}...'")
         response = self._invoke_llm_with_retry(prompt)
 
         return self._content_to_text(response.content).strip()
