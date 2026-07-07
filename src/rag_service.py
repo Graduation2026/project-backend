@@ -225,7 +225,8 @@ class ReportGenerationService:
             f"- **Risk Level**: {risk_level}\n"
             f"- **Total Functions Evaluated**: {total_functions}\n"
             f"- **Boilerplate Functions & Runtime Stubs Filtered**: {boilerplate_count}\n"
-            f"- **Actual Code Functions Scanned**: {actual_count}\n\n"
+            f"- **Actual Code Functions Scanned**: {actual_count}\n"
+            f"- **Note**: CWE labels are AI-suggested. Confirm against source code before remediation.\n\n"
         )
 
     def _build_mitigations_section(self) -> str:
@@ -297,7 +298,8 @@ class ReportGenerationService:
         """Pull a human-readable CWE label out of an analysis block.
 
         Prefers the full 'Threat ID' line (e.g. 'CWE-787: Out-of-bounds Write'),
-        falling back to a bare CWE token, then to CWE-119 if nothing parses.
+        falling back to a bare CWE token, then to 'Unclassified' if nothing parses.
+        An honest 'Unclassified' is preferred over a misleadingly confident CWE-119.
         """
         threat_match = re.search(r'\*\*Threat ID\*\*\s*:\s*(CWE-\d+[^\n]*)', block, re.IGNORECASE)
         if threat_match:
@@ -305,7 +307,7 @@ class ReportGenerationService:
         bare_match = re.search(r'(CWE-\d+)', block, re.IGNORECASE)
         if bare_match:
             return bare_match.group(1).upper()
-        return "CWE-119"
+        return "Unclassified"
 
     def _analyze_flagged_chunk(
         self, chunk: list[dict], ref_context: str,
@@ -343,8 +345,9 @@ Expected format:
 - **Threat ID**: ...
 
 CRITICAL RULES:
-- If the pattern is clear, assign the most specific CWE.
-- Only use CWE-119 if genuinely ambiguous.
+- Choose the Threat ID from ONLY this list: CWE-22, CWE-77, CWE-78, CWE-119, CWE-120, CWE-121, CWE-122, CWE-125, CWE-134, CWE-170, CWE-190, CWE-191, CWE-242, CWE-252, CWE-362, CWE-367, CWE-415, CWE-416, CWE-457, CWE-476, CWE-676, CWE-680, CWE-787, CWE-843, or "Unclassified".
+- Base your choice ONLY on the assembly and reference standards above. Do not guess.
+- If the assembly does not clearly match a specific CWE from the list, use "Unclassified" — do NOT force a specific CWE.
 - Return ONLY the numbered bullet blocks — no preamble, no commentary, no markdown headers."""
 
         logger.info(f"Analyzing flagged functions batch {chunk_num}/{total_chunks}...")
@@ -372,7 +375,7 @@ CRITICAL RULES:
 
             if not block:
                 block = (
-                    "- **Threat ID**: CWE-119 (Memory Operations)\n"
+                    "- **Threat ID**: Unclassified\n"
                     "- **Root Cause**: Vulnerability pattern flagged by GNN\n"
                     "- **CERT C Rule Violated**: Review CERT C guidelines\n"
                     "- **Fix Direction**: Review and remediate the flagged function"

@@ -76,13 +76,17 @@ BOILERPLATE_BLACKLIST = {
     "_pei386_runtime_relocator", "_FindPESection", "_FindPESectionByName",
     "_FindPESectionExec", "_GetPEImageBase", "_IsNonwritableInCurrentImage",
     "_onexit", "_amsg_exit", "_tzset", "tzset", "_get_output_format", "FUN_140001000",
+    "_setargv", "_matherr", "_gnu_exception_handler", "_ValidateImageBase",
+    "dtoa_lock", "dtoa_lock_cleanup", "strnlen", "wcsnlen", "_lock_file",
+    "_unlock_file", "mingw_get_invalid_parameter_handler", "mingw_set_invalid_parameter_handler",
+    "wcrtomb", "wcsrtombs", "mbrtowc", "mbsrtowcs", "mbrlen",
     
     # Linux ELF Startup
     "deregister_tm_clones", "register_tm_clones", "_start", "__libc_csu_init", 
     "__libc_csu_fini", "_dl_relocate_static_pie", "_init", "entry", "_start_c", "_fini",
     # MSVC CRT & Windows Startup
     "__scrt_common_main_seh", "_mainCRTStartup", "_wmainCRTStartup", "_WinMainCRTStartup",
-    "_DllMainCRTStartup", "__security_init_cookie", "__security_check_cookie",
+    "_DllMainCRTStartup", "DllMainCRTStartup", "_fpreset", "__security_init_cookie", "__security_check_cookie",
     "__report_gsfailure", "__local_stdio_printf_options", "__local_stdio_scanf_options",
     "_wsplitpath_s", "_vsnprintf_l", "_RTC_Initialize", "_RTC_Shutdown", "_RTC_Failure",
     "__scrt_initialize_crt", "__scrt_initialize_onexit_table", "__scrt_is_non_image_rva",
@@ -276,14 +280,10 @@ SAFE_APIS = {
 
 def is_trivial_stub(fname: str, nodes: list) -> bool:
     """Detect if a function is a trivial compiler-generated stub.
-    Matches FUN_ prefixed symbols with <= 2 basic blocks and no outgoing calls."""
+    Matches FUN_ prefixed symbols with <= 6 basic blocks (often CRT initialization)."""
     if not fname.startswith("FUN_"):
         return False
-    for node in nodes:
-        for instr in node.get("instructions", []):
-            if "CALL" in instr or "call" in instr:
-                return False
-    if len(nodes) <= 2:
+    if len(nodes) <= 6:
         return True
     return False
 
